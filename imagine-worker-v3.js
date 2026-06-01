@@ -1233,10 +1233,8 @@ app.post('/chat', async (req, res) => {
       return null;
     }
 
-    // Stream response
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    // Stream response — handle both Web Streams API and Node.js streams
+    let sseBuffer = '';
     const toolCallBuffers = {};
     let currentToolIndex = -1;
     let assistantText = '';
@@ -1244,90 +1242,119 @@ app.post('/chat', async (req, res) => {
     let finishReason = null;
     let lastWidgetCodeLen = 0;
 
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+    // Helper: process SSE lines from the Fireworks response
+    function processSSELines(lines) {
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') {
+          finishReason = finishReason || 'stop';
+          return;
+        }
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
+        let chunk;
+        try { chunk = JSON.parse(data); } catch { continue; }
+        const choice = chunk.choices?.[0];
+        if (!choice) continue;
 
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (data === '[DONE]') {
-            finishReason = finishReason || 'stop';
-            break;
+        const delta = choice.delta || {};
+        finishReason = choice.finish_reason || finishReason;
+
+        // Reasoning content
+        if (delta.reasoning_content) {
+          assistantReasoning += delta.reasoning_content;
+          sendSSE('reasoning', { content: delta.reasoning_content, full: assistantReasoning });
+        }
+
+        // Text content — suppress if show_widget is streaming
+        if (delta.content) {
+          const widgetActive = Object.values(toolCallBuffers).some(b => b.name === 'show_widget');
+          if (!widgetActive) {
+            assistantText += delta.content;
+            sendSSE('text', { content: delta.content, full: assistantText });
           }
+        }
 
-          let chunk;
-          try { chunk = JSON.parse(data); } catch { continue; }
-          const choice = chunk.choices?.[0];
-          if (!choice) continue;
-
-          const delta = choice.delta || {};
-          finishReason = choice.finish_reason || finishReason;
-
-          // Reasoning content
-          if (delta.reasoning_content) {
-            assistantReasoning += delta.reasoning_content;
-            sendSSE('reasoning', { content: delta.reasoning_content, full: assistantReasoning });
-          }
-
-          // Text content — suppress if show_widget is streaming
-          if (delta.content) {
-            const widgetActive = Object.values(toolCallBuffers).some(b => b.name === 'show_widget');
-            if (!widgetActive) {
-              assistantText += delta.content;
-              sendSSE('text', { content: delta.content, full: assistantText });
+        // Tool calls
+        if (delta.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index ?? 0;
+            if (!toolCallBuffers[idx]) {
+              toolCallBuffers[idx] = { id: '', name: '', args: '' };
+              sendSSE('tool_start', { index: idx, name: tc.function?.name || '...' });
             }
-          }
+            const buf = toolCallBuffers[idx];
+            if (tc.id) buf.id = tc.id;
+            if (tc.function?.name) {
+              if (!buf.name) sendSSE('tool_start', { index: idx, name: tc.function.name });
+              buf.name = tc.function.name;
+            }
+            if (tc.function?.arguments) {
+              buf.args += tc.function.arguments;
+              sendSSE('tool_delta', { index: idx, name: buf.name, args: buf.args });
 
-          // Tool calls
-          if (delta.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              const idx = tc.index ?? 0;
-              if (!toolCallBuffers[idx]) {
-                toolCallBuffers[idx] = { id: '', name: '', args: '' };
-                sendSSE('tool_start', { index: idx, name: tc.function?.name || '...' });
-              }
-              const buf = toolCallBuffers[idx];
-              if (tc.id) buf.id = tc.id;
-              if (tc.function?.name) {
-                if (!buf.name) sendSSE('tool_start', { index: idx, name: tc.function.name });
-                buf.name = tc.function.name;
-              }
-              if (tc.function?.arguments) {
-                buf.args += tc.function.arguments;
-                sendSSE('tool_delta', { index: idx, name: buf.name, args: buf.args });
-
-                // Live widget streaming
-                if (buf.name === 'show_widget') {
-                  const partialCode = extractWidgetCode(buf.args);
-                  if (partialCode && partialCode.length > 50) {
-                    const title = extractWidgetTitle(buf.args);
-                    // Simulate progressive streaming for models that deliver large chunks
-                    if (partialCode.length - lastWidgetCodeLen > 400) {
-                      const STEP = 300;
-                      for (let ci = lastWidgetCodeLen + STEP; ci < partialCode.length; ci += STEP) {
-                        const sliceCode = partialCode.slice(0, ci);
-                        ((_s, _t) => {
-                          setTimeout(() => sendSSE('widget_stream', { html: _s, title: _t }),
-                            Math.floor((ci - lastWidgetCodeLen) / STEP) * 100);
-                        })(sliceCode, title);
-                      }
+              // Live widget streaming
+              if (buf.name === 'show_widget') {
+                const partialCode = extractWidgetCode(buf.args);
+                if (partialCode && partialCode.length > 50) {
+                  const title = extractWidgetTitle(buf.args);
+                  if (partialCode.length - lastWidgetCodeLen > 400) {
+                    const STEP = 300;
+                    for (let ci = lastWidgetCodeLen + STEP; ci < partialCode.length; ci += STEP) {
+                      const sliceCode = partialCode.slice(0, ci);
+                      ((_s, _t) => {
+                        setTimeout(() => sendSSE('widget_stream', { html: _s, title: _t }),
+                          Math.floor((ci - lastWidgetCodeLen) / STEP) * 100);
+                      })(sliceCode, title);
                     }
-                    lastWidgetCodeLen = partialCode.length;
-                    sendSSE('widget_stream', { html: partialCode, title: title });
                   }
+                  lastWidgetCodeLen = partialCode.length;
+                  sendSSE('widget_stream', { html: partialCode, title: title });
                 }
               }
             }
           }
         }
+      }
+    }
 
-        if (finishReason === 'stop' || finishReason === 'tool_calls') break;
+    try {
+      // Try Web Streams API first (node-fetch v3+)
+      if (resp.body && typeof resp.body.getReader === 'function') {
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          sseBuffer += decoder.decode(value, { stream: true });
+          const lines = sseBuffer.split('\n');
+          sseBuffer = lines.pop();
+          processSSELines(lines);
+          if (finishReason === 'stop' || finishReason === 'tool_calls') break;
+        }
+      }
+      // Fallback: Node.js stream (for older node-fetch or native fetch)
+      else if (resp.body && typeof resp.body.on === 'function') {
+        await new Promise((resolve, reject) => {
+          resp.body.on('data', (chunk) => {
+            sseBuffer += chunk.toString();
+            const lines = sseBuffer.split('\n');
+            sseBuffer = lines.pop();
+            processSSELines(lines);
+            if (finishReason === 'stop' || finishReason === 'tool_calls') {
+              resp.body.destroy();
+              resolve();
+            }
+          });
+          resp.body.on('end', resolve);
+          resp.body.on('error', reject);
+        });
+      }
+      // Last resort: read entire response as text and parse
+      else {
+        const fullText = await resp.text();
+        const lines = fullText.split('\n');
+        processSSELines(lines);
       }
     } catch (e) {
       log('err', `[chat] Stream error: ${e.message}`);
