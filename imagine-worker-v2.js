@@ -14,20 +14,29 @@ app.use(express.json());
 // ==========================================
 // ENVIRONMENT VARIABLES (set in Railway)
 // ==========================================
-const SUPABASE_URL = process.env.SUPABASE_URL || '';
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
-const FIREWORKS_API_KEY = process.env.FIREWORKS_API_KEY || '';
-const PORT = process.env.PORT || 3000;
-const WORKER_SECRET = process.env.WORKER_SECRET || 'changeme';
+// Trim whitespace from env vars (Railway raw editor sometimes adds spaces/quotes)
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').trim().replace(/^["']|["']$/g, '');
+const SUPABASE_SERVICE_KEY = (process.env.SUPABASE_SERVICE_KEY || '').trim().replace(/^["']|["']$/g, '');
+const FIREWORKS_API_KEY = (process.env.FIREWORKS_API_KEY || '').trim().replace(/^["']|["']$/g, '');
+const PORT = parseInt((process.env.PORT || '3000').trim(), 10);
+const WORKER_SECRET = (process.env.WORKER_SECRET || 'changeme').trim().replace(/^["']|["']$/g, '');
 
-// Only init Supabase if both URL and key are provided
+// Only init Supabase if both URL and key are provided and look valid
 // Server will still start for health checks even without Supabase
 let supabase = null;
-if (SUPABASE_URL && SUPABASE_SERVICE_KEY) {
-  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-  console.log('Supabase client initialized');
+if (SUPABASE_URL && SUPABASE_URL.startsWith('https://') && SUPABASE_SERVICE_KEY && SUPABASE_SERVICE_KEY.length > 20) {
+  try {
+    supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+    console.log('Supabase client initialized for:', SUPABASE_URL);
+  } catch (err) {
+    console.error('Failed to init Supabase client:', err.message);
+    supabase = null;
+  }
 } else {
-  console.log('WARNING: SUPABASE_URL and SUPABASE_SERVICE_KEY not set — job processing disabled');
+  console.log('WARNING: SUPABASE_URL and/or SUPABASE_SERVICE_KEY not set or invalid — job processing disabled');
+  console.log('  SUPABASE_URL length:', SUPABASE_URL.length, 'starts with https://', SUPABASE_URL.startsWith('https://'));
+  console.log('  SUPABASE_SERVICE_KEY length:', SUPABASE_SERVICE_KEY.length);
+  console.log('  FIREWORKS_API_KEY length:', FIREWORKS_API_KEY.length);
   console.log('Server will start but /run endpoint will return errors until env vars are configured');
 }
 
