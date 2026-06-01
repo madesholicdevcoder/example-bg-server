@@ -1178,8 +1178,356 @@ app.post('/run', async (req, res) => {
 
   // Run in background
   runJob(job_id).catch(e => {
-    console.error(`Fatal error in job ${job_id}:`, e);
+    console.error(`Fatal error in job ${jobId}:`, e);
   });
+});
+
+// ==========================================
+// /chat — SSE endpoint for thin client
+// Receives messages + model + features + secret,
+// streams SSE events back to the client.
+// ==========================================
+app.post('/chat', async (req, res) => {
+  const { messages: clientMessages, model, features: clientFeatures, secret } = req.body;
+
+  // Validate secret
+  if (secret !== WORKER_SECRET) {
+    return res.status(403).json({ error: 'Invalid worker secret' });
+  }
+  if (!FIREWORKS_API_KEY) {
+    return res.status(503).json({ error: 'Fireworks API key not configured — set FIREWORKS_API_KEY env var' });
+  }
+  if (!clientMessages || !Array.isArray(clientMessages) || clientMessages.length === 0) {
+    return res.status(400).json({ error: 'messages array required' });
+  }
+
+  // Apply feature overrides from client
+  const savedFeatures = Object.assign({}, FEATURES);
+  if (clientFeatures && typeof clientFeatures === 'object') {
+    Object.keys(FEATURE_DEFAULTS).forEach(k => {
+      if (clientFeatures[k] !== undefined) FEATURES[k] = clientFeatures[k];
+      else FEATURES[k] = FEATURE_DEFAULTS[k];
+    });
+  }
+
+  // Set model
+  const selectedModel = MODEL_PREFIX + (model || DEFAULT_MODEL);
+  setSelectedModel(model || DEFAULT_MODEL);
+
+  // Set up SSE response headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  // Helper: send SSE event
+  function sse(evt) {
+    try {
+      res.write('data: ' + JSON.stringify(evt) + '\n\n');
+    } catch(e) {
+      // Client disconnected
+    }
+  }
+
+  // Build the messages array with system prompt
+  const systemPrompt = getEffectiveSystemPrompt();
+  let messages = [{ role: 'system', content: systemPrompt }];
+  for (const m of clientMessages) {
+    if (m.role === 'user' || m.role === 'assistant') {
+      messages.push({ role: m.role, content: m.content });
+    }
+  }
+
+  // Recursive API call handler for SSE streaming
+  async function doCall(forceTool) {
+    const body = {
+      model: selectedModel,
+      messages: messages,
+      tools: TOOLS,
+      tool_choice: (FEATURES.forceNext && forceTool) ? { type: 'function', function: { name: forceTool } } : 'auto',
+      stream: true,
+      max_tokens: FEATURES.maxTokensHigh ? 131072 : 65536,
+      temperature: FEATURES.tempOne ? 1 : 0.7,
+      reasoning_effort: FEATURES.reasoningHigh ? 'high' : 'medium'
+    };
+
+    log('info', `[/chat] → ${selectedModel} | max_tokens:${body.max_tokens} | temp:${body.temperature} | tool_choice:${forceTool ? 'force:'+forceTool : 'auto'} | msgs:${messages.length}`);
+
+    let resp;
+    try {
+      resp = await fetch(API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${FIREWORKS_API_KEY}`,
+          'Accept': 'text/event-stream'
+        },
+        body: JSON.stringify(body)
+      });
+    } catch(e) {
+      log('err', `[/chat] fetch failed: ${e.message}`);
+      sse({ type: 'error', message: 'Network error: ' + e.message });
+      return { assistantText: '', assistantReasoning: '', toolCalls: [], finishReason: 'error' };
+    }
+
+    if (!resp.ok) {
+      let errText = '';
+      try { errText = await resp.text(); } catch(e2) {}
+      let errMsg = `API error ${resp.status}`;
+      try {
+        const errJson = JSON.parse(errText);
+        errMsg += ': ' + (errJson.error?.message || errJson.message || errText.slice(0, 200));
+      } catch { errMsg += ': ' + errText.slice(0, 200); }
+      log('err', `[/chat] HTTP ${resp.status}: ${errMsg}`);
+      sse({ type: 'error', message: errMsg });
+      return { assistantText: '', assistantReasoning: '', toolCalls: [], finishReason: 'error' };
+    }
+
+    // Read SSE stream from Fireworks and forward as our own SSE events
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const toolCallBuffers = {};
+    let assistantText = '';
+    let assistantReasoning = '';
+    let finishReason = null;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') {
+            finishReason = finishReason || 'stop';
+            break;
+          }
+
+          let chunk;
+          try { chunk = JSON.parse(data); } catch { continue; }
+          const choice = chunk.choices?.[0];
+          if (!choice) continue;
+
+          const delta = choice.delta || {};
+          finishReason = choice.finish_reason || finishReason;
+
+          // Reasoning content
+          if (delta.reasoning_content) {
+            assistantReasoning += delta.reasoning_content;
+            sse({ type: 'reasoning', content: delta.reasoning_content, full: assistantReasoning });
+          }
+
+          // Text content — suppress if show_widget is active
+          if (delta.content) {
+            const widgetActive = Object.values(toolCallBuffers).some(b => b.name === 'show_widget');
+            if (!widgetActive) {
+              assistantText += delta.content;
+              sse({ type: 'text', content: delta.content, full: assistantText });
+            }
+          }
+
+          // Tool calls
+          if (delta.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              const idx = tc.index ?? 0;
+              if (!toolCallBuffers[idx]) {
+                toolCallBuffers[idx] = { id: '', name: '', args: '' };
+                // Send tool_start event
+                if (tc.function?.name) {
+                  sse({ type: 'tool_start', index: idx, name: tc.function.name });
+                  log('info', `[/chat] tool_call[${idx}]: ${tc.function.name}()`);
+                }
+              }
+              const buf = toolCallBuffers[idx];
+              if (tc.id) buf.id = tc.id;
+              if (tc.function?.name) {
+                if (!buf.name) sse({ type: 'tool_start', index: idx, name: tc.function.name });
+                buf.name = tc.function.name;
+              }
+              if (tc.function?.arguments) {
+                buf.args += tc.function.arguments;
+                // Stream tool delta for widget live rendering
+                sse({ type: 'tool_delta', index: idx, name: buf.name, args: buf.args });
+              }
+            }
+          }
+        }
+        if (finishReason === 'stop' || finishReason === 'tool_calls') break;
+      }
+    } catch(e) {
+      log('err', `[/chat] Stream error: ${e.message}`);
+      sse({ type: 'error', message: 'Stream error: ' + e.message });
+    }
+
+    // Normalize finish reason
+    const toolCallsArr = Object.values(toolCallBuffers);
+    if (FEATURES.finishNorm && toolCallsArr.length > 0 && toolCallsArr.some(tc => tc.name)) {
+      finishReason = 'tool_calls';
+    }
+
+    for (const tc of toolCallsArr) {
+      if (!tc.args.trim()) {
+        log('warn', `[/chat] ${tc.name}() has empty args`);
+      } else {
+        log('ok', `[/chat] ${tc.name}() args: ${tc.args.length.toLocaleString()} chars | finish: ${finishReason}`);
+      }
+    }
+    if (toolCallsArr.length === 0) {
+      log('info', `[/chat] text-only response: ${assistantText.length} chars | finish: ${finishReason}`);
+    }
+
+    return { assistantText, assistantReasoning, toolCalls: toolCallsArr, finishReason };
+  }
+
+  // Main orchestration loop (same as runJob but via SSE)
+  try {
+    // First API call
+    const result1 = await doCall(undefined);
+
+    if (result1.finishReason === 'error') {
+      sse({ type: 'done', finishReason: 'error' });
+      res.end();
+      FEATURES = savedFeatures;
+      return;
+    }
+
+    if (result1.toolCalls.length > 0) {
+      // Build assistant message with tool_calls
+      const assistantMsg = {
+        role: 'assistant',
+        content: result1.assistantText || null,
+        tool_calls: result1.toolCalls.map(tc => ({
+          id: tc.id || ('call_' + Math.random().toString(36).slice(2)),
+          type: 'function',
+          function: { name: tc.name, arguments: tc.args }
+        }))
+      };
+      messages.push(assistantMsg);
+
+      // Execute each tool
+      for (let i = 0; i < result1.toolCalls.length; i++) {
+        const tc = result1.toolCalls[i];
+        const toolId = assistantMsg.tool_calls[i].id;
+
+        let toolResult;
+        try {
+          toolResult = executeTool(tc.name, tc.args);
+          const resultLen = typeof toolResult === 'string' ? toolResult.length : 0;
+          const sizeLabel = (FEATURES.sizeIndicator && tc.name === 'visualize_read_me') ? ` — ${resultLen.toLocaleString()} chars loaded` : '';
+          sse({ type: 'tool_result', index: i, name: tc.name, resultLen, sizeLabel });
+          log('ok', `[/chat] executed ${tc.name}() → ${resultLen.toLocaleString()} chars`);
+
+          // For show_widget, send widget_stream and widget_final events
+          if (tc.name === 'show_widget') {
+            let args;
+            try { args = JSON.parse(tc.args); } catch { args = {}; }
+            const title = args.title || 'widget';
+            const code = args.widget_code || '';
+            if (code) {
+              // Send partial widget for live preview
+              sse({ type: 'widget_stream', html: code, title });
+              // Send final widget
+              sse({ type: 'widget_final', html: code, title });
+              log('ok', `[/chat] widget_final: ${code.length.toLocaleString()} chars | title: ${title}`);
+            }
+          }
+        } catch(e) {
+          toolResult = 'Error: ' + e.message;
+          sse({ type: 'tool_result', index: i, name: tc.name, resultLen: 0, sizeLabel: '' });
+          log('err', `[/chat] executeTool ${tc.name}() threw: ${e.message}`);
+        }
+
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolId,
+          content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult)
+        });
+      }
+
+      // If finish reason was tool_calls, continue with another API call
+      if (result1.finishReason === 'tool_calls') {
+        const lastToolName = result1.toolCalls[result1.toolCalls.length - 1]?.name || '';
+        const forceNext = (FEATURES.forceNext && lastToolName === 'visualize_read_me') ? 'show_widget' : undefined;
+        if (forceNext) log('info', `[/chat] forcing tool_choice → ${forceNext}`);
+
+        const result2 = await doCall(forceNext);
+
+        if (result2.toolCalls.length > 0) {
+          const assistantMsg2 = {
+            role: 'assistant',
+            content: result2.assistantText || null,
+            tool_calls: result2.toolCalls.map(tc => ({
+              id: tc.id || ('call_' + Math.random().toString(36).slice(2)),
+              type: 'function',
+              function: { name: tc.name, arguments: tc.args }
+            }))
+          };
+          messages.push(assistantMsg2);
+
+          for (let i = 0; i < result2.toolCalls.length; i++) {
+            const tc = result2.toolCalls[i];
+            const toolId = assistantMsg2.tool_calls[i].id;
+
+            let toolResult2;
+            try {
+              toolResult2 = executeTool(tc.name, tc.args);
+              const resultLen = typeof toolResult2 === 'string' ? toolResult2.length : 0;
+              const sizeLabel = (FEATURES.sizeIndicator && tc.name === 'visualize_read_me') ? ` — ${resultLen.toLocaleString()} chars loaded` : '';
+              sse({ type: 'tool_result', index: i, name: tc.name, resultLen, sizeLabel });
+
+              if (tc.name === 'show_widget') {
+                let args;
+                try { args = JSON.parse(tc.args); } catch { args = {}; }
+                const title = args.title || 'widget';
+                const code = args.widget_code || '';
+                if (code) {
+                  sse({ type: 'widget_stream', html: code, title });
+                  sse({ type: 'widget_final', html: code, title });
+                }
+              }
+            } catch(e) {
+              toolResult2 = 'Error: ' + e.message;
+              sse({ type: 'tool_result', index: i, name: tc.name, resultLen: 0, sizeLabel: '' });
+            }
+
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolId,
+              content: typeof toolResult2 === 'string' ? toolResult2 : JSON.stringify(toolResult2)
+            });
+          }
+
+          // One more call if needed (after show_widget)
+          if (result2.finishReason === 'tool_calls') {
+            const result3 = await doCall(undefined);
+            if (result3.assistantText) {
+              messages.push({ role: 'assistant', content: result3.assistantText });
+            }
+          }
+        }
+      }
+    }
+
+    // Send done event
+    sse({ type: 'done', finishReason: result1.finishReason || 'stop' });
+    res.end();
+  } catch(e) {
+    log('err', `[/chat] Fatal error: ${e.message}\n${e.stack}`);
+    try {
+      sse({ type: 'error', message: e.message });
+      sse({ type: 'done', finishReason: 'error' });
+    } catch(e2) {}
+    try { res.end(); } catch(e3) {}
+  } finally {
+    // Restore features
+    FEATURES = savedFeatures;
+  }
 });
 
 // ==========================================
