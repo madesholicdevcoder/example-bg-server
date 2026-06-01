@@ -14,13 +14,22 @@ app.use(express.json());
 // ==========================================
 // ENVIRONMENT VARIABLES (set in Railway)
 // ==========================================
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const FIREWORKS_API_KEY = process.env.FIREWORKS_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+const FIREWORKS_API_KEY = process.env.FIREWORKS_API_KEY || '';
 const PORT = process.env.PORT || 3000;
 const WORKER_SECRET = process.env.WORKER_SECRET || 'changeme';
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+// Only init Supabase if both URL and key are provided
+// Server will still start for health checks even without Supabase
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_SERVICE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+  console.log('Supabase client initialized');
+} else {
+  console.log('WARNING: SUPABASE_URL and SUPABASE_SERVICE_KEY not set — job processing disabled');
+  console.log('Server will start but /run endpoint will return errors until env vars are configured');
+}
 
 // ==========================================
 // GUIDELINES (base64 encoded) — EXTRACTED VERBATIM
@@ -1147,6 +1156,12 @@ app.post('/run', async (req, res) => {
   }
   if (!job_id) {
     return res.status(400).json({ error: 'job_id required' });
+  }
+  if (!supabase) {
+    return res.status(503).json({ error: 'Supabase not configured — set SUPABASE_URL and SUPABASE_SERVICE_KEY env vars' });
+  }
+  if (!FIREWORKS_API_KEY) {
+    return res.status(503).json({ error: 'Fireworks API key not configured — set FIREWORKS_API_KEY env var' });
   }
 
   // Start the job asynchronously — don't wait for completion
