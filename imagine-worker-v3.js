@@ -1156,7 +1156,17 @@ async function runJob(jobId) {
 // EXPRESS SERVER
 // ==========================================
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
+  // Debug: show env var status (not values)
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    supabase: supabase ? 'connected' : 'not_configured',
+    supabase_url_set: SUPABASE_URL.length > 0,
+    supabase_key_set: SUPABASE_SERVICE_KEY.length > 0,
+    worker_secret_set: WORKER_SECRET !== 'changeme',
+    worker_secret_len: WORKER_SECRET.length,
+    fireworks_key_set: FIREWORKS_API_KEY.length > 0
+  });
 });
 
 app.post('/run', async (req, res) => {
