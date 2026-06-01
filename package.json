@@ -1,12 +1,12 @@
 {
   "name": "imagine-worker",
-  "version": "1.0.0",
-  "description": "Imagine Visualization Builder — Server-side Worker",
+  "version": "2.0.0",
+  "description": "Imagine Visualization Builder — Server-side Worker (Node.js safe)",
   "type": "module",
-  "main": "server.js",
+  "main": "imagine-worker-v2.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node imagine-worker-v2.js",
+    "dev": "node --watch imagine-worker-v2.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
