@@ -32,6 +32,7 @@ if (SUPABASE_URL && SUPABASE_URL.startsWith('https://') && SUPABASE_SERVICE_KEY 
     console.log('Supabase client initialized for:', SUPABASE_URL);
   } catch (err) {
     console.error('Failed to init Supabase client:', err.message);
+    supabaseInitError = err.message;
     supabase = null;
   }
 } else {
@@ -1162,6 +1163,7 @@ app.get('/health', (req, res) => {
     status: 'ok',
     uptime: process.uptime(),
     supabase: supabase ? 'connected' : 'not_configured',
+    supabase_init_error: supabaseInitError,
     supabase_url_set: SUPABASE_URL.length > 0,
     supabase_url_prefix: SUPABASE_URL.substring(0, 8),
     supabase_key_set: SUPABASE_SERVICE_KEY.length > 0,
