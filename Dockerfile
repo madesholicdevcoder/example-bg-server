@@ -5,7 +5,7 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --production
 
-COPY imagine-worker-v2.js ./
+COPY imagine-worker-v2-fixed.js ./imagine-worker-v2.js
 
 EXPOSE 3000
 
