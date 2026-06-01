@@ -25,6 +25,7 @@ const WORKER_SECRET = (process.env.WORKER_SECRET || 'changeme').trim().replace(/
 // Only init Supabase if both URL and key are provided and look valid
 // Server will still start for health checks even without Supabase
 let supabase = null;
+let supabaseInitError = null;
 if (SUPABASE_URL && SUPABASE_URL.startsWith('https://') && SUPABASE_SERVICE_KEY && SUPABASE_SERVICE_KEY.length > 20) {
   try {
     supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
@@ -1162,7 +1163,9 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     supabase: supabase ? 'connected' : 'not_configured',
     supabase_url_set: SUPABASE_URL.length > 0,
+    supabase_url_prefix: SUPABASE_URL.substring(0, 8),
     supabase_key_set: SUPABASE_SERVICE_KEY.length > 0,
+    supabase_key_len: SUPABASE_SERVICE_KEY.length,
     worker_secret_set: WORKER_SECRET !== 'changeme',
     worker_secret_len: WORKER_SECRET.length,
     fireworks_key_set: FIREWORKS_API_KEY.length > 0
