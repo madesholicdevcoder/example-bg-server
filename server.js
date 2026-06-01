@@ -6,7 +6,8 @@
 
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
-import fetch from 'node-fetch';
+// Use Node.js 20 built-in fetch (supports Web Streams getReader()) instead of node-fetch
+// node-fetch v3 returns Node.js Readable streams that don't support getReader()
 
 const app = express();
 app.use(express.json());
