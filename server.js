@@ -1182,6 +1182,76 @@ app.post('/run', async (req, res) => {
   });
 });
 
+// ==========================================
+// POLLING: Auto-pickup pending jobs from Supabase
+// This eliminates the need for a public Railway URL
+// ==========================================
+const POLL_INTERVAL_MS = 3000; // Check every 3 seconds
+let isPolling = false;
+
+async function pollForJobs() {
+  if (isPolling || !supabase) return;
+  isPolling = true;
+
+  try {
+    // Find the oldest pending job
+    const { data: jobs, error } = await supabase
+      .from('jobs')
+      .select('id, model, features, api_key')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })
+      .limit(1);
+
+    if (error) {
+      console.error('Poll error:', error.message);
+      return;
+    }
+
+    if (!jobs || jobs.length === 0) return;
+
+    const job = jobs[0];
+    console.log(`[POLL] Picked up job ${job.id}`);
+
+    // Atomically claim the job (only if still pending)
+    const { data: updated, error: updateError } = await supabase
+      .from('jobs')
+      .update({ status: 'running', updated_at: new Date().toISOString() })
+      .eq('id', job.id)
+      .eq('status', 'pending')
+      .select();
+
+    if (updateError) {
+      console.error(`[POLL] Claim error for ${job.id}:`, updateError.message);
+      return;
+    }
+
+    if (!updated || updated.length === 0) {
+      // Another worker claimed it first — that's fine
+      console.log(`[POLL] Job ${job.id} already claimed by another worker`);
+      return;
+    }
+
+    // Process the job using the existing runJob function
+    // runJob reads everything from Supabase itself — just pass the ID
+    await runJob(job.id);
+
+  } catch (err) {
+    console.error('[POLL] Unexpected error:', err.message);
+  } finally {
+    isPolling = false;
+  }
+}
+
+// Start polling after a short delay to let server initialize
+setTimeout(() => {
+  if (supabase) {
+    console.log(`[POLL] Starting job poller (every ${POLL_INTERVAL_MS}ms)`);
+    setInterval(pollForJobs, POLL_INTERVAL_MS);
+    // Also poll immediately
+    pollForJobs();
+  }
+}, 2000);
+
 app.listen(PORT, () => {
   console.log(`Imagine Worker listening on port ${PORT}`);
 });
