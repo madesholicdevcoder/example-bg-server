@@ -295,15 +295,8 @@ function getBaseSP() {
   return new TextDecoder('utf-8').decode(arr);
 }
 
-// Load persisted flags from localStorage, fall back to defaults
-function loadFeatures() {
-  try {
-    const saved = JSON.parse(localStorage.getItem('imagine_features') || '{}');
-    return Object.assign({}, FEATURE_DEFAULTS, saved);
-  } catch { return Object.assign({}, FEATURE_DEFAULTS); }
-}
-
-let FEATURES = loadFeatures();
+// Server: no localStorage — use FEATURE_DEFAULTS directly
+// (Feature overrides come from job.config on a per-job basis inside runJob())
 const FEATURE_DEFAULTS = {
   viz_merged:      true,   // always prepend 84KB merged guidelines
   finishNorm:      true,   // normalize finishReason to 'tool_calls' when tools present
@@ -317,16 +310,16 @@ const FEATURE_DEFAULTS = {
   thinkingUI:      true,   // show reasoning/thinking blocks in chat
 };
 
-// Base system prompt (verbatim from base version) — b64 encoded
-function saveFeatures() {
-  localStorage.setItem('imagine_features', JSON.stringify(FEATURES));
-}
+let FEATURES = Object.assign({}, FEATURE_DEFAULTS);
+
+// Server: saveFeatures is a no-op (no localStorage in Node.js)
+function saveFeatures() {}
 
 // Toggle a feature by key — called by checkbox onchange
 function toggleFeature(key, val) {
   FEATURES[key] = val;
-  saveFeatures();
-  applyFeatureUI(key, val);
+  saveFeatures(); // no-op on server
+  // applyFeatureUI is a no-op on server (no DOM)
   log('info', `feature ${key} → ${val}`);
 }
 
@@ -340,15 +333,9 @@ function resetMessagesWithPrompt() {
   messages = [{ role: 'system', content: getEffectiveSystemPrompt() }];
 }
 
-// Visual feedback when a feature changes
+// Visual feedback when a feature changes (no-op on server — no DOM)
 function applyFeatureUI(key, val) {
-  const el = document.getElementById('ft-' + key);
-  if (el) el.classList.toggle('ft-on', val);
-  // If log system toggled, show/hide log panel
-  if (key === 'logSystem') {
-    const lp = $('log-panel');
-    if (lp) lp.style.display = val ? '' : 'none';
-  }
+  // Server: no DOM elements to update
 }
 
 // Apply all feature states to UI on load
@@ -381,16 +368,18 @@ function isGlmModel(model = getSelectedModel()) {
   return model.startsWith('glm');
 }
 
+// Server: model comes from job config, not DOM selector
+let _serverModel = DEFAULT_MODEL;
 function getSelectedModel() {
-  const value = $('modelSelect')?.value?.trim();
-  return value || DEFAULT_MODEL;
+  return _serverModel;
+}
+function setSelectedModel(m) {
+  _serverModel = m || DEFAULT_MODEL;
 }
 
 function syncModelBadge() {
-  const model = getSelectedModel();
-  const badge = $('modelName');
-  if (badge) badge.textContent = model;
-  return model;
+  // Server: no DOM badge to update
+  return _serverModel;
 }
 
 // ==========================================
@@ -447,13 +436,13 @@ function extractWidgetTitle(argStr) {
 // API CALL (Fireworks streaming)
 // ==========================================
 async function callAPI(msgs, onChunk, onToolCall, onDone, forceTool) {
-  const apiKey = $('apiKey').value.trim();
+  const apiKey = FIREWORKS_API_KEY;
   if (!apiKey) {
-    showError('Please enter your Fireworks API key');
+    log('err', 'No FIREWORKS_API_KEY env var set');
     return;
   }
 
-  const selectedModel = syncModelBadge();
+  const selectedModel = getSelectedModel();
   log('info', `→ ${MODEL_PREFIX + selectedModel} | max_tokens:131072 | reasoning:high | temp:1 | tool_choice:${forceTool ? 'force:'+forceTool : 'auto'} | msgs:${msgs.length}`);
   const body = {
     model: MODEL_PREFIX + selectedModel,
@@ -479,7 +468,7 @@ async function callAPI(msgs, onChunk, onToolCall, onDone, forceTool) {
     });
   } catch(e) {
     log('err', `fetch failed: ${e.message}`);
-    showError('Network error: ' + e.message);
+    log('err', 'Network error: ' + e.message);
     onDone(null, e.message);
     return;
   }
@@ -578,8 +567,8 @@ async function callAPI(msgs, onChunk, onToolCall, onDone, forceTool) {
                 const partialCode = extractWidgetCode(buf.args);
                 if (partialCode && partialCode.length > 50) {
                   const title = extractWidgetTitle(buf.args);
-                  if (title) $('widget-title').textContent = title.replace(/_/g,' ');
-                  $('stream-badge').classList.add('visible');
+                  // Server: no DOM — widget title logged instead
+                  if (title) log('info', `widget title: ${title.replace(/_/g,' ')}`);
                   const prevCodeLen = buf._lastCodeLen || 0;
                   buf._lastCodeLen = partialCode.length;
                   // Simulate progressive streaming for models (e.g. Qwen) that deliver
@@ -606,7 +595,7 @@ async function callAPI(msgs, onChunk, onToolCall, onDone, forceTool) {
       if (finishReason === 'stop' || finishReason === 'tool_calls') break;
     }
   } catch(e) {
-    if (e.name !== 'AbortError') showError('Stream error: ' + e.message);
+    if (e.name !== 'AbortError') log('err', 'Stream error: ' + e.message);
   }
 
   // Build result
