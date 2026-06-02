@@ -8,6 +8,7 @@
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
+import WebSocket from 'ws';
 
 const app = express();
 app.use(express.json());
@@ -29,7 +30,7 @@ let supabaseInitError = null;
 if (SUPABASE_URL && SUPABASE_URL.startsWith('https://') && SUPABASE_SERVICE_KEY && SUPABASE_SERVICE_KEY.length > 20) {
   try {
     supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-      realtime: { enabled: false }
+      realtime: { enabled: false, transport: WebSocket }
     });
     console.log('Supabase client initialized for:', SUPABASE_URL);
   } catch (err) {
