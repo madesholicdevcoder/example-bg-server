@@ -1517,6 +1517,10 @@ app.post('/chat', async (req, res) => {
       return;
     }
 
+    // Track all results across multi-turn for persistence
+    let result2 = null;
+    let result3 = null;
+
     if (result1.toolCalls.length > 0) {
       // Build assistant message with tool_calls for messages array
       const assistantMsg = {
@@ -1597,7 +1601,7 @@ app.post('/chat', async (req, res) => {
         const forceNext = (chatFeatures.forceNext && lastToolName === 'visualize_read_me') ? 'show_widget' : undefined;
         if (forceNext) log('info', `forcing tool_choice → ${forceNext}`);
 
-        const result2 = await doCall(messages, forceNext);
+        result2 = await doCall(messages, forceNext);
 
         if (result2.toolCalls.length > 0) {
           const assistantMsg2 = {
@@ -1668,7 +1672,7 @@ app.post('/chat', async (req, res) => {
 
           // One more call if needed (after show_widget)
           if (result2.finishReason === 'tool_calls') {
-            const result3 = await doCall(messages, undefined);
+            result3 = await doCall(messages, undefined);
             // Text-only response at this point
           }
         }
@@ -1681,8 +1685,8 @@ app.post('/chat', async (req, res) => {
         // Collect all assistant text across turns
         const allAssistantText = [
           result1.assistantText || '',
-          (typeof result2 !== 'undefined' && result2?.assistantText) || '',
-          (typeof result3 !== 'undefined' && result3?.assistantText) || ''
+          result2?.assistantText || '',
+          result3?.assistantText || ''
         ].filter(t => t.trim()).join('\n');
 
         if (allAssistantText) {
@@ -1696,8 +1700,8 @@ app.post('/chat', async (req, res) => {
         // Store widget if generated — check all result turns
         const allToolCalls = [
           ...(result1.toolCalls || []),
-          ...((typeof result2 !== 'undefined' && result2?.toolCalls) || []),
-          ...((typeof result3 !== 'undefined' && result3?.toolCalls) || [])
+          ...(result2?.toolCalls || []),
+          ...(result3?.toolCalls || [])
         ];
         const showWidgetTc = allToolCalls.find(tc => tc.name === 'show_widget');
         if (showWidgetTc) {
