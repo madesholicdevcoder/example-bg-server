@@ -479,8 +479,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg-base);color:var(--text
   </div>
   <div class="header-divider"></div>
   <div class="api-key-wrap">
-    <span class="api-key-label">Fireworks API key</span>
-    <input type="password" id="apiKey" placeholder="fw_...">
+    <span class="api-key-label">API key</span>
+    <input type="password" id="apiKey" placeholder="fw_... (or leave blank for server key)">
   </div>
   <div class="model-badge">
     <div class="model-dot"></div>
@@ -1164,17 +1164,23 @@ async function send() {
           continue;
         }
 
-        // ── Handle each SSE event type ──
+        // ── Handle each SSE event type from Railway worker ──
+        // Worker sends: text, reasoning, tool_start, tool_delta,
+        //               widget_stream, tool_result, widget_final, error, done
 
-        if (data.type === 'assistant_delta') {
-          // Streaming text content
+        if (data.type === 'text') {
+          // Streaming text content from worker
           if (data.content) {
             assistantText += data.content;
             updateMsgText(assistantMsgEl, assistantText, true);
           }
-          // Reasoning/thinking content
-          if (data.reasoning && FEATURES.thinkingUI) {
-            assistantReasoning += data.reasoning;
+          log('info', `text: +${(data.content||'').length} chars`);
+        }
+
+        else if (data.type === 'reasoning') {
+          // Reasoning/thinking content from worker
+          if (data.content && FEATURES.thinkingUI) {
+            assistantReasoning += data.content;
             let tb = assistantMsgEl.querySelector('.thinking-block');
             if (!tb) {
               tb = document.createElement('div');
@@ -1185,57 +1191,56 @@ async function send() {
             tb.querySelector('.thinking-body').textContent = assistantReasoning;
             scrollToBottom();
           }
-          log('info', `delta: content=${(data.content||'').length} reasoning=${(data.reasoning||'').length}`);
+          log('info', `reasoning: +${(data.content||'').length} chars`);
         }
 
-        else if (data.type === 'tool_call') {
-          // Tool call started
-          const callId = data.callId || ('call_' + Math.random().toString(36).slice(2));
+        else if (data.type === 'tool_start') {
+          // Tool call started — worker uses index as key
+          const idx = data.index;
           const name = data.name || '...';
-          const args = data.args || '';
-          log('info', `tool_call: ${name}() [${callId.slice(0,8)}]`);
+          const key = 'tc_' + idx;
+          log('info', `tool_start: ${name}() [idx=${idx}]`);
 
           const tcEl = createToolCallEl(name, 'calling...');
-          const argsEl = tcEl.querySelector('.tool-call-args');
-          const preview = args.slice(0, 150) + (args.length > 150 ? '...' : '');
-          argsEl.textContent = preview;
           assistantMsgEl.querySelector('.msg-body').appendChild(tcEl);
-          toolCallMap[callId] = { el: tcEl, name, args };
+          toolCallMap[key] = { el: tcEl, name, args: '' };
           scrollToBottom();
         }
 
-        else if (data.type === 'tool_call_delta') {
-          // Tool call args streaming
-          const callId = data.callId;
-          if (callId && toolCallMap[callId]) {
-            const tc = toolCallMap[callId];
-            if (data.argsDelta) {
-              tc.args += data.argsDelta;
+        else if (data.type === 'tool_delta') {
+          // Tool call args streaming — worker sends full accumulated args
+          const idx = data.index;
+          const key = 'tc_' + idx;
+          if (toolCallMap[key]) {
+            const tc = toolCallMap[key];
+            if (data.args) {
+              tc.args = data.args;
               const argsEl = tc.el.querySelector('.tool-call-args');
-              const preview = tc.args.slice(0, 150) + (tc.args.length > 150 ? '...' : '');
+              const preview = data.args.slice(0, 150) + (data.args.length > 150 ? '...' : '');
               argsEl.textContent = preview;
+            }
+            // Update name if it was initially '...'
+            if (data.name && tc.name === '...') {
+              tc.name = data.name;
+              tc.el.querySelector('.tool-call-name').textContent = data.name + '()';
             }
           }
         }
 
         else if (data.type === 'tool_result') {
-          // Tool result received
-          const callId = data.callId;
+          // Tool result received — worker sends index, name, resultLen, sizeLabel
+          const idx = data.index;
+          const key = 'tc_' + idx;
           const name = data.name || '';
-          const content = data.content || '';
-          const contentLen = content.length;
-          log('ok', `tool_result: ${name}() → ${contentLen} chars`);
+          const resultLen = data.resultLen || 0;
+          const sizeLabel = data.sizeLabel || '';
+          log('ok', `tool_result: ${name}() → ${resultLen} chars${sizeLabel}`);
 
-          // Find and update the tool call element
-          if (callId && toolCallMap[callId]) {
-            const tc = toolCallMap[callId];
+          if (toolCallMap[key]) {
+            const tc = toolCallMap[key];
             tc.el.querySelector('.tool-call-status').textContent = 'done';
             const indicator = document.createElement('div');
             indicator.className = 'tool-result-indicator';
-            let sizeLabel = '';
-            if (FEATURES.sizeIndicator && name === 'visualize_read_me') {
-              sizeLabel = ` — ${contentLen.toLocaleString()} chars loaded`;
-            }
             indicator.textContent = '\u2713 result ready' + sizeLabel;
             tc.el.appendChild(indicator);
           } else {
@@ -1246,10 +1251,6 @@ async function send() {
                 el.textContent = 'done';
                 const indicator = document.createElement('div');
                 indicator.className = 'tool-result-indicator';
-                let sizeLabel = '';
-                if (FEATURES.sizeIndicator && name === 'visualize_read_me') {
-                  sizeLabel = ` — ${contentLen.toLocaleString()} chars loaded`;
-                }
                 indicator.textContent = '\u2713 result ready' + sizeLabel;
                 el.closest('.tool-call').appendChild(indicator);
               }
@@ -1257,11 +1258,11 @@ async function send() {
           }
         }
 
-        else if (data.type === 'widget') {
-          // Widget code to render
-          const code = data.code || '';
+        else if (data.type === 'widget_stream') {
+          // Progressive widget rendering during show_widget tool call
+          const code = data.html || '';
           const title = data.title || '';
-          log('ok', `widget: ${code.length} chars | title: ${title}`);
+          log('info', `widget_stream: ${code.length} chars | title: ${title}`);
           widgetCode = code;
           scheduleWidgetUpdate(code);
           if (title) $('widget-title').textContent = title.replace(/_/g, ' ');
@@ -1269,18 +1270,9 @@ async function send() {
           $('bridge-data').textContent = 'widget: ' + (title || 'streaming');
         }
 
-        else if (data.type === 'widget_delta') {
-          // Partial widget code update
-          if (data.codeDelta) {
-            widgetCode += data.codeDelta;
-            scheduleWidgetUpdate(widgetCode);
-          }
-          log('info', `widget_delta: +${(data.codeDelta||'').length} chars`);
-        }
-
         else if (data.type === 'widget_final') {
-          // Final complete widget
-          const code = data.code || widgetCode;
+          // Final complete widget — worker sends html field
+          const code = data.html || widgetCode;
           const title = data.title || '';
           log('ok', `widget_final: ${code.length} chars | title: ${title}`);
           widgetCode = code;
