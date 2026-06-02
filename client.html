@@ -787,6 +787,8 @@ let widgetInitialized = false;
 let logCount = 0;
 let _liveSlot = null;
 let _liveActive = false;
+let _renderGen = 0;  // incremented on every finalizeWidget — cancels stale slice timeouts
+let currentWidgetTitle = 'widget preview';
 
 const $ = id => document.getElementById(id);
 
@@ -824,6 +826,19 @@ function toggleFeature(key, val) {
   FEATURES[key] = val;
   saveFeatures();
   applyFeatureUI(key, val);
+  // If strictPrompt toggled, reset conversation with new system prompt
+  if (key === 'strictPrompt') {
+    resetMessagesWithPrompt();
+  }
+}
+
+// Re-initialize messages with correct system prompt
+function resetMessagesWithPrompt() {
+  // On thin client, we just clear user/assistant messages but keep context
+  // The worker will apply the correct system prompt on next request
+  // Remove any existing system message from the array
+  messages = messages.filter(m => m.role !== 'system');
+  log('info', `system prompt reset — strictPrompt=${FEATURES.strictPrompt}`);
 }
 
 function applyFeatureUI(key, val) {
@@ -994,6 +1009,36 @@ function createToolCallEl(name, status) {
 // ==========================================
 // WIDGET RENDERING (morphdom-based)
 // ==========================================
+
+// Builds a complete standalone HTML page from a widget fragment.
+// No morphdom needed — works on any platform including content:// Android URLs.
+function buildWidgetPage(code) {
+  const isSvg = code.trimStart().startsWith('<svg');
+  const bodyStyle = isSvg
+    ? 'margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#1a1a1a;color:#e0e0e0;'
+    : 'margin:0;padding:1rem;background:#1a1a1a;color:#e0e0e0;min-height:100vh;';
+  return `<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=DM+Mono:wght@300;400;500&family=Syne:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box}
+:root{--font-ui:'DM Sans',system-ui,sans-serif;--font-mono:'DM Mono',monospace;--font-display:'Syne',sans-serif}
+html,body{font-family:var(--font-ui);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+code,pre,kbd,samp{font-family:var(--font-mono)}
+svg text{font-family:var(--font-ui)}
+@keyframes _fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+${SVG_STYLES.replace(/`/g,"'")}
+</style>
+<script>
+window.sendPrompt=function(t){window.parent.postMessage({type:'sendPrompt',text:t},'*');};
+window.glimpse={send:function(d){window.parent.postMessage({type:'glimpseData',data:d},'*');}};
+window.openLink=function(u){window.parent.postMessage({type:'openLink',url:u},'*');};
+<\/script>
+</head><body style="${bodyStyle}">${code}</body></html>`;
+}
+
 function initWidget() {
   const frame = $('widget-frame');
   frame.srcdoc = SHELL_HTML;
@@ -1056,14 +1101,21 @@ function scheduleWidgetUpdate(html) {
 }
 
 function finalizeWidget(html, title) {
-  if (_updateTimer) {
-    clearTimeout(_updateTimer);
-    _updateTimer = null;
-  }
-  _pendingHtml = null;
-  updateWidget(html, true);
-  if (title) $('widget-title').textContent = title.replace(/_/g, ' ');
+  if (!html) return;  // never abort streaming state for empty content
+  _renderGen++;          // invalidate stale slice timeouts
+  _liveSlot = null;      // discard any pending partial
+  _liveActive = false;   // stop the poll loop — direct inject takes over
+  if (_updateTimer) { clearTimeout(_updateTimer); _updateTimer = null; _pendingHtml = null; }
+  if (title) { $('widget-title').textContent = title.replace(/_/g, ' '); currentWidgetTitle = title; }
+
+  // Direct srcdoc injection — complete standalone page, no morphdom needed.
+  // Reliable on all platforms including Android content:// URLs.
+  const frame = $('widget-frame');
+  widgetInitialized = true;
+  $('widget-empty').classList.add('hidden');
+  frame.srcdoc = buildWidgetPage(html);
   $('stream-badge').classList.remove('visible');
+  log('ok', `widget rendered: ${html.length.toLocaleString()} chars → direct srcdoc`);
 }
 
 // ==========================================
@@ -1399,6 +1451,7 @@ $('apiKey').addEventListener('input', function() {
 
 $('modelSelect').addEventListener('change', function() {
   syncModelBadge();
+  localStorage.setItem('imagine_model', this.value);
 });
 
 // ==========================================
@@ -1433,6 +1486,15 @@ window.addEventListener('resize', checkScreenSize);
   // Restore API key
   const savedKey = localStorage.getItem('fw_api_key');
   if (savedKey) $('apiKey').value = savedKey;
+
+  // Restore model selection
+  const savedModel = localStorage.getItem('imagine_model');
+  if (savedModel) {
+    const select = $('modelSelect');
+    for (const opt of select.options) {
+      if (opt.value === savedModel) { select.value = savedModel; break; }
+    }
+  }
 
   // Sync model badge
   syncModelBadge();
