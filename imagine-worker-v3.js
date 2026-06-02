@@ -1172,7 +1172,8 @@ app.get('/health', (req, res) => {
     supabase_key_len: SUPABASE_SERVICE_KEY.length,
     worker_secret_set: WORKER_SECRET !== 'changeme',
     worker_secret_len: WORKER_SECRET.length,
-    fireworks_key_set: FIREWORKS_API_KEY.length > 0
+    fireworks_key_set: FIREWORKS_API_KEY.length > 0,
+    client_api_key_supported: true
   });
 });
 
@@ -1205,15 +1206,17 @@ app.post('/run', async (req, res) => {
 // This is the critical new endpoint that client.html calls
 // ==========================================
 app.post('/chat', async (req, res) => {
-  const { messages: clientMessages, model, features: clientFeatures, secret } = req.body;
+  const { messages: clientMessages, model, features: clientFeatures, secret, apiKey: clientApiKey } = req.body;
 
   // Validate secret
   if (secret !== WORKER_SECRET) {
     return res.status(403).json({ error: { message: 'Invalid worker secret' } });
   }
 
-  if (!FIREWORKS_API_KEY) {
-    return res.status(503).json({ error: { message: 'Fireworks API key not configured' } });
+  // Use client-provided API key if available, otherwise fall back to env var
+  const effectiveApiKey = (clientApiKey && clientApiKey.trim()) || FIREWORKS_API_KEY;
+  if (!effectiveApiKey) {
+    return res.status(503).json({ error: { message: 'Fireworks API key not configured — provide apiKey in request or set FIREWORKS_API_KEY env var' } });
   }
 
   if (!clientMessages || !Array.isArray(clientMessages) || clientMessages.length === 0) {
@@ -1285,7 +1288,7 @@ app.post('/chat', async (req, res) => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${FIREWORKS_API_KEY}`,
+          'Authorization': `Bearer ${effectiveApiKey}`,
           'Accept': 'text/event-stream'
         },
         body: JSON.stringify(body)
