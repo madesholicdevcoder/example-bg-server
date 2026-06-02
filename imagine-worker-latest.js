@@ -1678,8 +1678,13 @@ app.post('/chat', async (req, res) => {
     // Persist results to Supabase
     if (supabase && chatJobId) {
       try {
-        // Store assistant message
-        const allAssistantText = result1.assistantText || '';
+        // Collect all assistant text across turns
+        const allAssistantText = [
+          result1.assistantText || '',
+          (typeof result2 !== 'undefined' && result2?.assistantText) || '',
+          (typeof result3 !== 'undefined' && result3?.assistantText) || ''
+        ].filter(t => t.trim()).join('\n');
+
         if (allAssistantText) {
           await supabase.from('messages').insert({
             job_id: chatJobId,
@@ -1688,8 +1693,13 @@ app.post('/chat', async (req, res) => {
             seq: 2
           });
         }
-        // Store widget if generated
-        const showWidgetTc = result1.toolCalls?.find(tc => tc.name === 'show_widget');
+        // Store widget if generated — check all result turns
+        const allToolCalls = [
+          ...(result1.toolCalls || []),
+          ...((typeof result2 !== 'undefined' && result2?.toolCalls) || []),
+          ...((typeof result3 !== 'undefined' && result3?.toolCalls) || [])
+        ];
+        const showWidgetTc = allToolCalls.find(tc => tc.name === 'show_widget');
         if (showWidgetTc) {
           let widgetArgs;
           try { widgetArgs = JSON.parse(showWidgetTc.args); } catch { widgetArgs = {}; }
