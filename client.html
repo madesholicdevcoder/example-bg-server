@@ -480,7 +480,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg-base);color:var(--text
   <div class="header-divider"></div>
   <div class="api-key-wrap">
     <span class="api-key-label">API key</span>
-    <input type="password" id="apiKey" placeholder="fw_... (or leave blank for server key)">
+    <input type="password" id="apiKey" placeholder="Leave blank to use server key">
   </div>
   <div class="model-badge">
     <div class="model-dot"></div>
@@ -1209,7 +1209,10 @@ async function send() {
   let widgetCode = '';    // accumulated widget code
 
   try {
-    const apiKey = $('apiKey').value.trim() || undefined;
+    const apiKey = $('apiKey').value.trim();
+    // Only send API key if it looks like a valid Fireworks key (starts with fw_)
+    // Invalid keys cause 401 errors — better to use the server key
+    const effectiveApiKey = (apiKey.startsWith('fw_') && apiKey.length > 10) ? apiKey : undefined;
     const model = $('modelSelect').value || 'minimax-m2p7';
 
     const body = {
@@ -1219,7 +1222,7 @@ async function send() {
       secret: WORKER_SECRET,
       tab_id: TAB_ID  // Multi-tab isolation: each tab gets unique processing
     };
-    if (apiKey) body.apiKey = apiKey;
+    if (effectiveApiKey) body.apiKey = effectiveApiKey;
 
     log('info', `POST /chat | model: ${model} | msgs: ${messages.length} | features: ${JSON.stringify(FEATURES)}`);
 
