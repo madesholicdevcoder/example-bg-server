@@ -7,8 +7,8 @@
 
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
-import fetch from 'node-fetch';
-import WebSocket from 'ws';
+// Native fetch in Node 20+ — no need for node-fetch (which lacks getReader())
+import { WebSocket } from 'ws';
 
 const app = express();
 app.use(express.json());
