@@ -22,6 +22,7 @@ const SUPABASE_SERVICE_KEY = (process.env.SUPABASE_SERVICE_KEY || '').trim().rep
 const FIREWORKS_API_KEY = (process.env.FIREWORKS_API_KEY || '').trim().replace(/^["']|["']$/g, '');
 const PORT = parseInt((process.env.PORT || '3000').trim(), 10);
 const WORKER_SECRET = (process.env.WORKER_SECRET || 'changeme').trim().replace(/^["']|["']$/g, '');
+const activeChatConnections = new Map();
 
 // Only init Supabase if both URL and key are provided and look valid
 // Server will still start for health checks even without Supabase
@@ -1214,8 +1215,26 @@ app.post('/chat', async (req, res) => {
     return res.status(403).json({ error: { message: 'Invalid worker secret' } });
   }
 
-  // Use client-provided API key if available, otherwise fall back to env var
-  const effectiveApiKey = (clientApiKey && clientApiKey.trim()) || FIREWORKS_API_KEY;
+  // Track active connections per tab to prevent multi-tab conflicts
+  const connKey = tabId || 'default';
+  if (activeChatConnections.has(connKey)) {
+    // Another request from same tab is still running — abort the old one
+    const oldConn = activeChatConnections.get(connKey);
+    try { oldConn.res.end(); } catch(e) {}
+    log('warn', `Aborting stale connection for tab ${connKey}`);
+  }
+  activeChatConnections.set(connKey, { res, startedAt: Date.now() });
+
+  // Clean up on finish
+  const origEnd = res.end.bind(res);
+  res.end = function(...args) {
+    activeChatConnections.delete(connKey);
+    return origEnd(...args);
+  };
+
+  // Use client-provided API key only if it looks like a valid Fireworks key (starts with fw_)
+  const clientKeyTrimmed = (clientApiKey || '').trim();
+  const effectiveApiKey = (clientKeyTrimmed.startsWith('fw_') && clientKeyTrimmed.length > 10) ? clientKeyTrimmed : FIREWORKS_API_KEY;
   if (!effectiveApiKey) {
     return res.status(503).json({ error: { message: 'Fireworks API key not configured — provide apiKey in request or set FIREWORKS_API_KEY env var' } });
   }
@@ -1265,6 +1284,40 @@ app.post('/chat', async (req, res) => {
   const selectedModel = chatModel.startsWith('accounts/') ? chatModel : (MODEL_PREFIX + chatModel);
 
   log('info', `─── /chat turn start | model: ${selectedModel} | msgs: ${messages.length} | features: ${JSON.stringify(chatFeatures)} ───`);
+
+  // Create Supabase job record for /chat sessions (persistence)
+  let chatJobId = null;
+  if (supabase) {
+    try {
+      const { data: jobData, error: jobErr } = await supabase
+        .from('jobs')
+        .insert({
+          status: 'running',
+          model: chatModel,
+          features: chatFeatures,
+          source: 'direct_chat'
+        })
+        .select()
+        .single();
+      if (!jobErr && jobData) {
+        chatJobId = jobData.id;
+        // Store user message
+        await supabase.from('messages').insert({
+          job_id: chatJobId,
+          role: 'user',
+          content: clientMessages[clientMessages.length - 1]?.content || '',
+          seq: 1
+        });
+      }
+    } catch (dbErr) {
+      log('warn', `Failed to create chat job: ${dbErr.message}`);
+    }
+  }
+
+  // Send job_id to client for reconnection
+  if (chatJobId) {
+    sseSend({ type: 'job_id', job_id: chatJobId });
+  }
 
   // ==========================================
   // Inner doCall function — makes one API call and streams SSE events
@@ -1451,6 +1504,14 @@ app.post('/chat', async (req, res) => {
     const result1 = await doCall(messages, undefined);
 
     if (result1.finishReason === 'error') {
+      if (supabase && chatJobId) {
+        try {
+          await supabase.from('jobs').update({
+            status: 'error',
+            updated_at: new Date().toISOString()
+          }).eq('id', chatJobId);
+        } catch (dbErr2) { /* silent */ }
+      }
       sseSend({ type: 'done', finishReason: 'error' });
       res.end();
       return;
@@ -1614,17 +1675,113 @@ app.post('/chat', async (req, res) => {
       }
     }
 
+    // Persist results to Supabase
+    if (supabase && chatJobId) {
+      try {
+        // Store assistant message
+        const allAssistantText = result1.assistantText || '';
+        if (allAssistantText) {
+          await supabase.from('messages').insert({
+            job_id: chatJobId,
+            role: 'assistant',
+            content: allAssistantText,
+            seq: 2
+          });
+        }
+        // Store widget if generated
+        const showWidgetTc = result1.toolCalls?.find(tc => tc.name === 'show_widget');
+        if (showWidgetTc) {
+          let widgetArgs;
+          try { widgetArgs = JSON.parse(showWidgetTc.args); } catch { widgetArgs = {}; }
+          const widgetCode = widgetArgs.widget_code || '';
+          const widgetTitle = widgetArgs.title || 'widget';
+          if (widgetCode) {
+            await supabase.from('widgets').insert({
+              job_id: chatJobId,
+              title: widgetTitle,
+              code: widgetCode,
+              is_final: true
+            });
+          }
+        }
+        // Update job status to completed
+        await supabase.from('jobs').update({
+          status: 'completed',
+          updated_at: new Date().toISOString()
+        }).eq('id', chatJobId);
+      } catch (dbErr) {
+        log('warn', `Failed to persist chat results: ${dbErr.message}`);
+      }
+    }
+
     // Send done event
     sseSend({ type: 'done', finishReason: result1.finishReason || 'stop' });
     log('info', `─── /chat turn complete ───`);
 
   } catch (e) {
     log('err', `/chat failed: ${e.message}\n${e.stack}`);
+    // Persist error to Supabase
+    if (supabase && chatJobId) {
+      try {
+        await supabase.from('jobs').update({
+          status: 'error',
+          error: e.message?.slice(0, 500) || 'Unknown error',
+          updated_at: new Date().toISOString()
+        }).eq('id', chatJobId);
+      } catch (dbErr2) { /* silent */ }
+    }
     sseSend({ type: 'error', message: e.message });
     sseSend({ type: 'done', finishReason: 'error' });
   }
 
   res.end();
+});
+
+// Resume endpoint for reconnection
+app.get('/resume/:jobId', async (req, res) => {
+  const { jobId } = req.params;
+  const secret = req.query.secret;
+
+  if (secret !== WORKER_SECRET) {
+    return res.status(403).json({ error: 'Invalid secret' });
+  }
+
+  if (!supabase) {
+    return res.status(503).json({ error: 'Supabase not configured' });
+  }
+
+  try {
+    const { data: job, error } = await supabase
+      .from('jobs')
+      .select('id, status, model, error')
+      .eq('id', jobId)
+      .single();
+
+    if (error || !job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Get messages
+    const { data: msgs } = await supabase
+      .from('messages')
+      .select('role, content, seq')
+      .eq('job_id', jobId)
+      .order('seq', { ascending: true });
+
+    // Get widgets
+    const { data: widgets } = await supabase
+      .from('widgets')
+      .select('title, code, is_final')
+      .eq('job_id', jobId);
+
+    res.json({
+      job,
+      messages: msgs || [],
+      widgets: widgets || []
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Handle CORS preflight for /chat
