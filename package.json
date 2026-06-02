@@ -3,10 +3,10 @@
   "version": "3.1.0",
   "description": "Imagine Visualization Builder \u2014 Server-side Worker (Node.js safe)",
   "type": "module",
-  "main": "imagine-worker-v3.js",
+  "main": "imagine-worker-latest.js",
   "scripts": {
-    "start": "node imagine-worker-v3.js",
-    "dev": "node --watch imagine-worker-v3.js"
+    "start": "node imagine-worker-latest.js",
+    "dev": "node --watch imagine-worker-latest.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

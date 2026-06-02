@@ -1,12 +1,14 @@
 // ==========================================
-// IMAGINE WORKER — Railway Container
+// IMAGINE WORKER V3 — Railway Container
 // Server-side version of imagine-v15.html
 // All JS logic runs here; client is thin HTML
+// + POST /chat SSE endpoint for direct client streaming
 // ==========================================
 
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
-import fetch from 'node-fetch';
+// Native fetch in Node 20+ — no need for node-fetch (which lacks getReader())
+import { WebSocket } from 'ws';
 
 const app = express();
 app.use(express.json());
@@ -24,12 +26,16 @@ const WORKER_SECRET = (process.env.WORKER_SECRET || 'changeme').trim().replace(/
 // Only init Supabase if both URL and key are provided and look valid
 // Server will still start for health checks even without Supabase
 let supabase = null;
+let supabaseInitError = null;
 if (SUPABASE_URL && SUPABASE_URL.startsWith('https://') && SUPABASE_SERVICE_KEY && SUPABASE_SERVICE_KEY.length > 20) {
   try {
-    supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+    supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+      realtime: { enabled: true, transport: WebSocket }
+    });
     console.log('Supabase client initialized for:', SUPABASE_URL);
   } catch (err) {
     console.error('Failed to init Supabase client:', err.message);
+    supabaseInitError = err.message;
     supabase = null;
   }
 } else {
@@ -39,6 +45,52 @@ if (SUPABASE_URL && SUPABASE_URL.startsWith('https://') && SUPABASE_SERVICE_KEY 
   console.log('  FIREWORKS_API_KEY length:', FIREWORKS_API_KEY.length);
   console.log('Server will start but /run endpoint will return errors until env vars are configured');
 }
+
+// ==========================================
+// CONCURRENCY CONTROL — Semaphore for API calls
+// Prevents overlapping Fireworks requests that cause
+// midway stops and multi-tab race conditions
+// ==========================================
+const MAX_CONCURRENT = 3;
+const activeJobs = new Map(); // jobId -> { startedAt, model, status }
+let currentConcurrent = 0;
+const jobQueue = []; // queued job entries
+
+async function acquireSlot(jobId) {
+  return new Promise((resolve) => {
+    if (currentConcurrent < MAX_CONCURRENT) {
+      currentConcurrent++;
+      activeJobs.set(jobId, { startedAt: Date.now(), status: 'running' });
+      resolve();
+    } else {
+      jobQueue.push({ jobId, resolve });
+      log('info', `Job ${jobId} queued (${jobQueue.length} waiting, ${currentConcurrent} active)`);
+    }
+  });
+}
+
+function releaseSlot(jobId) {
+  activeJobs.delete(jobId);
+  currentConcurrent--;
+  if (jobQueue.length > 0) {
+    const next = jobQueue.shift();
+    currentConcurrent++;
+    activeJobs.set(next.jobId, { startedAt: Date.now(), status: 'running' });
+    next.resolve();
+    log('info', `Queued job ${next.jobId} started (${jobQueue.length} still waiting)`);
+  }
+}
+
+// Cleanup stale jobs (running > 10 min) every 60s
+setInterval(() => {
+  const now = Date.now();
+  for (const [jid, info] of activeJobs) {
+    if (now - info.startedAt > 10 * 60 * 1000) {
+      log('warn', `Stale job ${jid} running >10min, force-releasing slot`);
+      releaseSlot(jid);
+    }
+  }
+}, 60000);
 
 // ==========================================
 // GUIDELINES (base64 encoded) — EXTRACTED VERBATIM
@@ -706,6 +758,10 @@ function log(level, msg) {
 // Writes all state to Supabase DB instead of DOM
 // ==========================================
 async function runJob(jobId) {
+  // Acquire concurrency slot
+  await acquireSlot(jobId);
+
+  try {
   // Read job details from DB
   const { data: job, error: jobErr } = await supabase
     .from('jobs')
@@ -1148,6 +1204,9 @@ async function runJob(jobId) {
     log('err', `Job ${jobId} failed: ${e.message}\n${e.stack}`);
     stopWidgetWriteInterval();
     await supabase.from('jobs').update({ status: 'error', error: e.message }).eq('id', jobId);
+  } finally {
+    // Always release concurrency slot
+    releaseSlot(jobId);
   }
 }
 
@@ -1155,7 +1214,23 @@ async function runJob(jobId) {
 // EXPRESS SERVER
 // ==========================================
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
+  // Debug: show env var status (not values)
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    supabase: supabase ? 'connected' : 'not_configured',
+    supabase_init_error: supabaseInitError,
+    supabase_url_set: SUPABASE_URL.length > 0,
+    supabase_url_prefix: SUPABASE_URL.substring(0, 8),
+    supabase_key_set: SUPABASE_SERVICE_KEY.length > 0,
+    supabase_key_len: SUPABASE_SERVICE_KEY.length,
+    worker_secret_set: WORKER_SECRET !== 'changeme',
+    worker_secret_len: WORKER_SECRET.length,
+    fireworks_key_set: FIREWORKS_API_KEY.length > 0,
+    client_api_key_supported: true,
+    concurrency: { active: currentConcurrent, max: MAX_CONCURRENT, queued: jobQueue.length },
+    active_jobs: Array.from(activeJobs.keys())
+  });
 });
 
 app.post('/run', async (req, res) => {
@@ -1178,81 +1253,246 @@ app.post('/run', async (req, res) => {
 
   // Run in background
   runJob(job_id).catch(e => {
-    console.error(`Fatal error in job ${jobId}:`, e);
+    console.error(`Fatal error in job ${job_id}:`, e);
   });
 });
 
 // ==========================================
-// /chat — SSE endpoint for thin client
-// Receives messages + model + features + secret,
-// streams SSE events back to the client.
+// POST /chat — SSE streaming endpoint for direct client access
+// This is the critical new endpoint that client.html calls
 // ==========================================
 app.post('/chat', async (req, res) => {
-  const { messages: clientMessages, model, features: clientFeatures, secret } = req.body;
+  const { messages: clientMessages, model, features: clientFeatures, secret, apiKey: clientApiKey, tab_id: tabId } = req.body;
 
   // Validate secret
   if (secret !== WORKER_SECRET) {
-    return res.status(403).json({ error: 'Invalid worker secret' });
-  }
-  if (!FIREWORKS_API_KEY) {
-    return res.status(503).json({ error: 'Fireworks API key not configured — set FIREWORKS_API_KEY env var' });
-  }
-  if (!clientMessages || !Array.isArray(clientMessages) || clientMessages.length === 0) {
-    return res.status(400).json({ error: 'messages array required' });
+    return res.status(403).json({ error: { message: 'Invalid worker secret' } });
   }
 
-  // Apply feature overrides from client
-  const savedFeatures = Object.assign({}, FEATURES);
+  // Use client-provided API key if available, otherwise fall back to env var
+  const effectiveApiKey = (clientApiKey && clientApiKey.trim()) || FIREWORKS_API_KEY;
+  if (!effectiveApiKey) {
+    return res.status(503).json({ error: { message: 'Fireworks API key not configured — provide apiKey in request or set FIREWORKS_API_KEY env var' } });
+  }
+
+  if (!clientMessages || !Array.isArray(clientMessages) || clientMessages.length === 0) {
+    return res.status(400).json({ error: { message: 'messages array required' } });
+  }
+
+  // ==========================================
+  // MULTI-TAB: Track active SSE connections per tab
+  // If a tab sends a new request while still streaming, close the old one
+  // ==========================================
+  const activeTabConnections = app.get('activeTabConnections') || new Map();
+  if (tabId && activeTabConnections.has(tabId)) {
+    const oldConn = activeTabConnections.get(tabId);
+    log('info', `Tab ${tabId} has existing connection — closing old SSE stream`);
+    try { oldConn.res.end(); } catch(e) {}
+    releaseSlot(oldConn.jobId);
+    activeTabConnections.delete(tabId);
+  }
+  app.set('activeTabConnections', activeTabConnections);
+
+  // ==========================================
+  // PERSISTENCE: Create job in Supabase for crash recovery
+  // Even if SSE disconnects, the job continues in background
+  // ==========================================
+  const chatJobId = 'chat-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+  let dbJobId = null;
+  let sseDisconnected = false;
+
+  if (supabase) {
+    try {
+      const chatFeaturesTmp = Object.assign({}, FEATURE_DEFAULTS);
+      if (clientFeatures && typeof clientFeatures === 'object') {
+        Object.keys(clientFeatures).forEach(k => {
+          if (chatFeaturesTmp[k] !== undefined) chatFeaturesTmp[k] = clientFeatures[k];
+        });
+      }
+      const { data: jobRow, error: jobErr } = await supabase.from('jobs').insert({
+        status: 'running',
+        model: model || DEFAULT_MODEL,
+        features: chatFeaturesTmp
+      }).select().single();
+      if (!jobErr && jobRow) {
+        dbJobId = jobRow.id;
+        // Write the user messages to DB
+        let seq = 1;
+        for (const m of clientMessages) {
+          if (m.role === 'user' && m.content) {
+            await supabase.from('messages').insert({ job_id: dbJobId, role: 'user', content: m.content, seq: seq++ });
+          }
+        }
+        log('info', `Persistence: created job ${dbJobId} for /chat session`);
+      } else {
+        log('warn', `Persistence: could not create job: ${jobErr?.message}`);
+      }
+    } catch (e) {
+      log('warn', `Persistence: job creation failed: ${e.message}`);
+    }
+  }
+
+  // Acquire concurrency slot
+  await acquireSlot(chatJobId);
+
+  // Set up SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'X-Accel-Buffering': 'no'  // Disable nginx buffering
+  });
+
+  // Send the job_id to the client so it can reconnect/resume
+  if (dbJobId) {
+    try { res.write(`data: ${JSON.stringify({ type: 'job_id', job_id: dbJobId })}\n\n`); } catch(e) {}
+  }
+
+  // Track if SSE is still connected
+  req.on('close', () => {
+    sseDisconnected = true;
+    // Clean up tab connection tracking
+    const conns = app.get('activeTabConnections');
+    if (tabId && conns && conns.get(tabId)?.jobId === chatJobId) {
+      conns.delete(tabId);
+    }
+    log('info', `SSE client disconnected for ${chatJobId} — background processing continues`);
+  });
+
+  // Register this tab's active connection
+  if (tabId) {
+    activeTabConnections.set(tabId, { res, jobId: chatJobId });
+    app.set('activeTabConnections', activeTabConnections);
+  }
+
+  // Helper to send SSE event (only if client still connected)
+  function sseSend(data) {
+    if (sseDisconnected) return; // Client gone, but processing continues
+    try {
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch (e) {
+      log('err', `SSE write error: ${e.message}`);
+      sseDisconnected = true;
+    }
+  }
+
+  // Throttled DB writes for persistence (don't write every token)
+  let _lastAssistantWrite = 0;
+  let _accumulatedAssistant = '';
+  let _accumulatedReasoning = '';
+  let _lastWidgetWrite = 0;
+  let _widgetSeq = 10; // starts after user messages
+  let _toolCallSeq = 0;
+  const DB_WRITE_INTERVAL = 1000; // Write to DB every 1s max
+
+  async function persistAssistantText(text, isFinal = false) {
+    if (!supabase || !dbJobId) return;
+    _accumulatedAssistant = text;
+    const now = Date.now();
+    if (isFinal || now - _lastAssistantWrite > DB_WRITE_INTERVAL) {
+      _lastAssistantWrite = now;
+      try {
+        // Upsert the assistant message (one row per turn, updated as it streams)
+        const { data: existing } = await supabase.from('messages')
+          .select('id').eq('job_id', dbJobId).eq('role', 'assistant')
+          .order('seq', { ascending: false }).limit(1).single();
+        if (existing) {
+          await supabase.from('messages').update({ content: _accumulatedAssistant })
+            .eq('id', existing.id);
+        } else {
+          _widgetSeq++;
+          await supabase.from('messages').insert({
+            job_id: dbJobId, role: 'assistant', content: _accumulatedAssistant, seq: _widgetSeq
+          });
+        }
+      } catch (e) { /* non-critical */ }
+    }
+  }
+
+  async function persistWidget(code, title, isFinal) {
+    if (!supabase || !dbJobId) return;
+    const now = Date.now();
+    if (isFinal || now - _lastWidgetWrite > 500) {
+      _lastWidgetWrite = now;
+      try {
+        const { data: existing } = await supabase.from('widgets')
+          .select('id').eq('job_id', dbJobId).limit(1).single();
+        if (existing) {
+          await supabase.from('widgets').update({
+            code, title: title || 'widget', is_final: isFinal,
+            updated_at: new Date().toISOString()
+          }).eq('id', existing.id);
+        } else {
+          await supabase.from('widgets').insert({
+            job_id: dbJobId, code, title: title || 'widget', is_final: isFinal
+          });
+        }
+      } catch (e) { /* non-critical */ }
+    }
+  }
+
+  async function persistToolCall(name, args, status) {
+    if (!supabase || !dbJobId) return;
+    try {
+      _toolCallSeq++;
+      await supabase.from('tool_calls').insert({
+        job_id: dbJobId, name,
+        args: typeof args === 'string' ? args : JSON.stringify(args),
+        status
+      });
+    } catch (e) { /* non-critical */ }
+  }
+
+  async function persistJobComplete(status, error = null) {
+    if (!supabase || !dbJobId) return;
+    try {
+      await supabase.from('jobs').update({
+        status, error, updated_at: new Date().toISOString()
+      }).eq('id', dbJobId);
+    } catch (e) { /* non-critical */ }
+  }
+
+  // Set up feature flags from request body, falling back to defaults
+  const chatFeatures = Object.assign({}, FEATURE_DEFAULTS);
   if (clientFeatures && typeof clientFeatures === 'object') {
-    Object.keys(FEATURE_DEFAULTS).forEach(k => {
-      if (clientFeatures[k] !== undefined) FEATURES[k] = clientFeatures[k];
-      else FEATURES[k] = FEATURE_DEFAULTS[k];
+    Object.keys(clientFeatures).forEach(k => {
+      if (chatFeatures[k] !== undefined) {
+        chatFeatures[k] = clientFeatures[k];
+      }
     });
   }
 
-  // Set model
-  const selectedModel = MODEL_PREFIX + (model || DEFAULT_MODEL);
-  setSelectedModel(model || DEFAULT_MODEL);
+  // Set model from request body
+  const chatModel = model || DEFAULT_MODEL;
 
-  // Set up SSE response headers
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders();
+  // Build system prompt based on features.strictPrompt
+  const systemPrompt = chatFeatures.strictPrompt ? SYSTEM_PROMPT_V7 : getBaseSP();
 
-  // Helper: send SSE event
-  function sse(evt) {
-    try {
-      res.write('data: ' + JSON.stringify(evt) + '\n\n');
-    } catch(e) {
-      // Client disconnected
-    }
-  }
+  // Build messages array with system prompt
+  const messages = [{ role: 'system', content: systemPrompt }, ...clientMessages];
 
-  // Build the messages array with system prompt
-  const systemPrompt = getEffectiveSystemPrompt();
-  let messages = [{ role: 'system', content: systemPrompt }];
-  for (const m of clientMessages) {
-    if (m.role === 'user' || m.role === 'assistant') {
-      messages.push({ role: m.role, content: m.content });
-    }
-  }
+  // Model string handling
+  const selectedModel = chatModel.startsWith('accounts/') ? chatModel : (MODEL_PREFIX + chatModel);
 
-  // Recursive API call handler for SSE streaming
-  async function doCall(forceTool) {
+  log('info', `─── /chat turn start | model: ${selectedModel} | msgs: ${messages.length} | features: ${JSON.stringify(chatFeatures)} ───`);
+
+  // ==========================================
+  // Inner doCall function — makes one API call and streams SSE events
+  // ==========================================
+  async function doCall(msgs, forceTool) {
     const body = {
       model: selectedModel,
-      messages: messages,
+      messages: msgs,
       tools: TOOLS,
-      tool_choice: (FEATURES.forceNext && forceTool) ? { type: 'function', function: { name: forceTool } } : 'auto',
+      tool_choice: (chatFeatures.forceNext && forceTool) ? { type: 'function', function: { name: forceTool } } : 'auto',
       stream: true,
-      max_tokens: FEATURES.maxTokensHigh ? 131072 : 65536,
-      temperature: FEATURES.tempOne ? 1 : 0.7,
-      reasoning_effort: FEATURES.reasoningHigh ? 'high' : 'medium'
+      max_tokens: chatFeatures.maxTokensHigh ? 131072 : 65536,
+      temperature: chatFeatures.tempOne ? 1 : 0.7,
+      reasoning_effort: chatFeatures.reasoningHigh ? 'high' : 'medium'
     };
 
-    log('info', `[/chat] → ${selectedModel} | max_tokens:${body.max_tokens} | temp:${body.temperature} | tool_choice:${forceTool ? 'force:'+forceTool : 'auto'} | msgs:${messages.length}`);
+    log('info', `→ ${selectedModel} | max_tokens:${body.max_tokens} | temp:${body.temperature} | tool_choice:${forceTool ? 'force:'+forceTool : 'auto'} | msgs:${msgs.length}`);
 
     let resp;
     try {
@@ -1260,31 +1500,31 @@ app.post('/chat', async (req, res) => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${FIREWORKS_API_KEY}`,
+          'Authorization': `Bearer ${effectiveApiKey}`,
           'Accept': 'text/event-stream'
         },
         body: JSON.stringify(body)
       });
-    } catch(e) {
-      log('err', `[/chat] fetch failed: ${e.message}`);
-      sse({ type: 'error', message: 'Network error: ' + e.message });
+    } catch (e) {
+      log('err', `fetch failed: ${e.message}`);
+      sseSend({ type: 'error', message: 'Network error: ' + e.message });
       return { assistantText: '', assistantReasoning: '', toolCalls: [], finishReason: 'error' };
     }
 
     if (!resp.ok) {
       let errText = '';
-      try { errText = await resp.text(); } catch(e2) {}
+      try { errText = await resp.text(); } catch (e2) {}
       let errMsg = `API error ${resp.status}`;
       try {
         const errJson = JSON.parse(errText);
-        errMsg += ': ' + (errJson.error?.message || errJson.message || errText.slice(0, 200));
-      } catch { errMsg += ': ' + errText.slice(0, 200); }
-      log('err', `[/chat] HTTP ${resp.status}: ${errMsg}`);
-      sse({ type: 'error', message: errMsg });
+        errMsg += ': ' + (errJson.error?.message || errJson.message || errText.slice(0, 100));
+      } catch { errMsg += ': ' + errText.slice(0, 100); }
+      log('err', `HTTP ${resp.status}: ${errMsg}`);
+      sseSend({ type: 'error', message: errMsg });
       return { assistantText: '', assistantReasoning: '', toolCalls: [], finishReason: 'error' };
     }
 
-    // Read SSE stream from Fireworks and forward as our own SSE events
+    // Read SSE stream from Fireworks API
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -1320,15 +1560,25 @@ app.post('/chat', async (req, res) => {
           // Reasoning content
           if (delta.reasoning_content) {
             assistantReasoning += delta.reasoning_content;
-            sse({ type: 'reasoning', content: delta.reasoning_content, full: assistantReasoning });
+            sseSend({
+              type: 'reasoning',
+              content: delta.reasoning_content,
+              full: assistantReasoning
+            });
           }
 
-          // Text content — suppress if show_widget is active
+          // Text content — suppress if show_widget is already streaming
           if (delta.content) {
             const widgetActive = Object.values(toolCallBuffers).some(b => b.name === 'show_widget');
             if (!widgetActive) {
               assistantText += delta.content;
-              sse({ type: 'text', content: delta.content, full: assistantText });
+              sseSend({
+                type: 'text',
+                content: delta.content,
+                full: assistantText
+              });
+              // Persist assistant text to DB (throttled)
+              persistAssistantText(assistantText);
             }
           }
 
@@ -1338,67 +1588,91 @@ app.post('/chat', async (req, res) => {
               const idx = tc.index ?? 0;
               if (!toolCallBuffers[idx]) {
                 toolCallBuffers[idx] = { id: '', name: '', args: '' };
-                // Send tool_start event
+                // Send tool_start event when we first see this tool call index
                 if (tc.function?.name) {
-                  sse({ type: 'tool_start', index: idx, name: tc.function.name });
-                  log('info', `[/chat] tool_call[${idx}]: ${tc.function.name}()`);
+                  sseSend({ type: 'tool_start', index: idx, name: tc.function.name });
+                } else {
+                  sseSend({ type: 'tool_start', index: idx, name: '...' });
                 }
               }
               const buf = toolCallBuffers[idx];
               if (tc.id) buf.id = tc.id;
               if (tc.function?.name) {
-                if (!buf.name) sse({ type: 'tool_start', index: idx, name: tc.function.name });
                 buf.name = tc.function.name;
+                log('info', `tool_call[${idx}]: ${tc.function.name}()`);
               }
               if (tc.function?.arguments) {
                 buf.args += tc.function.arguments;
-                // Stream tool delta for widget live rendering
-                sse({ type: 'tool_delta', index: idx, name: buf.name, args: buf.args });
+
+                // Send tool_delta event
+                sseSend({
+                  type: 'tool_delta',
+                  index: idx,
+                  name: buf.name,
+                  args: buf.args
+                });
+
+                // Live widget streaming for show_widget
+                if (buf.name === 'show_widget') {
+                  const partialCode = extractWidgetCode(buf.args);
+                  if (partialCode && partialCode.length > 50) {
+                    const title = extractWidgetTitle(buf.args);
+                    // Send widget_stream event for progressive rendering
+                    sseSend({
+                      type: 'widget_stream',
+                      html: partialCode,
+                      title: title || undefined
+                    });
+                    // Persist widget to DB (throttled) for crash recovery
+                    persistWidget(partialCode, title, false);
+                  }
+                }
               }
             }
           }
         }
         if (finishReason === 'stop' || finishReason === 'tool_calls') break;
       }
-    } catch(e) {
-      log('err', `[/chat] Stream error: ${e.message}`);
-      sse({ type: 'error', message: 'Stream error: ' + e.message });
+    } catch (e) {
+      log('err', `Stream error: ${e.message}`);
+      sseSend({ type: 'error', message: 'Stream error: ' + e.message });
     }
 
     // Normalize finish reason
     const toolCallsArr = Object.values(toolCallBuffers);
-    if (FEATURES.finishNorm && toolCallsArr.length > 0 && toolCallsArr.some(tc => tc.name)) {
+    if (chatFeatures.finishNorm && toolCallsArr.length > 0 && toolCallsArr.some(tc => tc.name)) {
       finishReason = 'tool_calls';
     }
 
     for (const tc of toolCallsArr) {
       if (!tc.args.trim()) {
-        log('warn', `[/chat] ${tc.name}() has empty args`);
+        log('warn', `${tc.name}() has empty args`);
       } else {
-        log('ok', `[/chat] ${tc.name}() args: ${tc.args.length.toLocaleString()} chars | finish: ${finishReason}`);
+        log('ok', `${tc.name}() args: ${tc.args.length.toLocaleString()} chars | finish: ${finishReason}`);
       }
     }
     if (toolCallsArr.length === 0) {
-      log('info', `[/chat] text-only response: ${assistantText.length} chars | finish: ${finishReason}`);
+      log('info', `text-only response: ${assistantText.length} chars | finish: ${finishReason}`);
     }
 
     return { assistantText, assistantReasoning, toolCalls: toolCallsArr, finishReason };
   }
 
-  // Main orchestration loop (same as runJob but via SSE)
+  // ==========================================
+  // Multi-turn orchestration loop (adapted from v15's send())
+  // ==========================================
   try {
     // First API call
-    const result1 = await doCall(undefined);
+    const result1 = await doCall(messages, undefined);
 
     if (result1.finishReason === 'error') {
-      sse({ type: 'done', finishReason: 'error' });
+      sseSend({ type: 'done', finishReason: 'error' });
       res.end();
-      FEATURES = savedFeatures;
       return;
     }
 
     if (result1.toolCalls.length > 0) {
-      // Build assistant message with tool_calls
+      // Build assistant message with tool_calls for messages array
       const assistantMsg = {
         role: 'assistant',
         content: result1.assistantText || null,
@@ -1410,39 +1684,66 @@ app.post('/chat', async (req, res) => {
       };
       messages.push(assistantMsg);
 
-      // Execute each tool
+      // Execute each tool and send tool_result events
       for (let i = 0; i < result1.toolCalls.length; i++) {
         const tc = result1.toolCalls[i];
         const toolId = assistantMsg.tool_calls[i].id;
 
         let toolResult;
-        try {
-          toolResult = executeTool(tc.name, tc.args);
-          const resultLen = typeof toolResult === 'string' ? toolResult.length : 0;
-          const sizeLabel = (FEATURES.sizeIndicator && tc.name === 'visualize_read_me') ? ` — ${resultLen.toLocaleString()} chars loaded` : '';
-          sse({ type: 'tool_result', index: i, name: tc.name, resultLen, sizeLabel });
-          log('ok', `[/chat] executed ${tc.name}() → ${resultLen.toLocaleString()} chars`);
+        let resultLen = 0;
+        let sizeLabel = '';
 
-          // For show_widget, send widget_stream and widget_final events
-          if (tc.name === 'show_widget') {
-            let args;
-            try { args = JSON.parse(tc.args); } catch { args = {}; }
-            const title = args.title || 'widget';
-            const code = args.widget_code || '';
-            if (code) {
-              // Send partial widget for live preview
-              sse({ type: 'widget_stream', html: code, title });
-              // Send final widget
-              sse({ type: 'widget_final', html: code, title });
-              log('ok', `[/chat] widget_final: ${code.length.toLocaleString()} chars | title: ${title}`);
-            }
+        if (tc.name === 'visualize_read_me') {
+          // Execute visualize_read_me → return guidelines
+          let args;
+          try { args = JSON.parse(tc.args); } catch { args = {}; }
+          const modules = args.modules || [];
+          toolResult = getModuleGuidelines(modules);
+          resultLen = typeof toolResult === 'string' ? toolResult.length : JSON.stringify(toolResult).length;
+          if (chatFeatures.sizeIndicator) {
+            sizeLabel = ` — ${resultLen.toLocaleString()} chars loaded`;
           }
-        } catch(e) {
-          toolResult = 'Error: ' + e.message;
-          sse({ type: 'tool_result', index: i, name: tc.name, resultLen: 0, sizeLabel: '' });
-          log('err', `[/chat] executeTool ${tc.name}() threw: ${e.message}`);
+          // Persist tool call to DB
+          persistToolCall('visualize_read_me', tc.args, 'done');
+        } else if (tc.name === 'show_widget') {
+          // Execute show_widget → extract widget code and send widget events
+          let args;
+          try { args = JSON.parse(tc.args); } catch { args = {}; }
+          const title = args.title || 'widget';
+          const code = args.widget_code || '';
+
+          if (code) {
+            // Send widget_final event with the complete widget
+            sseSend({
+              type: 'widget_final',
+              html: code,
+              title: title
+            });
+            // Persist final widget to DB
+            persistWidget(code, title, true);
+          }
+
+          toolResult = `Widget rendered successfully. Title: ${title}`;
+          resultLen = typeof toolResult === 'string' ? toolResult.length : JSON.stringify(toolResult).length;
+          // Persist tool call to DB
+          persistToolCall('show_widget', tc.args, 'done');
+        } else {
+          toolResult = `Tool ${tc.name} executed.`;
+          resultLen = typeof toolResult === 'string' ? toolResult.length : JSON.stringify(toolResult).length;
         }
 
+        // Send tool_result event
+        sseSend({
+          type: 'tool_result',
+          index: i,
+          name: tc.name,
+          resultLen,
+          sizeLabel
+        });
+
+        log('ok', `executed ${tc.name}() → ${resultLen.toLocaleString()} chars`);
+
+        // Add tool result to messages array
         messages.push({
           role: 'tool',
           tool_call_id: toolId,
@@ -1453,10 +1754,10 @@ app.post('/chat', async (req, res) => {
       // If finish reason was tool_calls, continue with another API call
       if (result1.finishReason === 'tool_calls') {
         const lastToolName = result1.toolCalls[result1.toolCalls.length - 1]?.name || '';
-        const forceNext = (FEATURES.forceNext && lastToolName === 'visualize_read_me') ? 'show_widget' : undefined;
-        if (forceNext) log('info', `[/chat] forcing tool_choice → ${forceNext}`);
+        const forceNext = (chatFeatures.forceNext && lastToolName === 'visualize_read_me') ? 'show_widget' : undefined;
+        if (forceNext) log('info', `forcing tool_choice → ${forceNext}`);
 
-        const result2 = await doCall(forceNext);
+        const result2 = await doCall(messages, forceNext);
 
         if (result2.toolCalls.length > 0) {
           const assistantMsg2 = {
@@ -1475,26 +1776,48 @@ app.post('/chat', async (req, res) => {
             const toolId = assistantMsg2.tool_calls[i].id;
 
             let toolResult2;
-            try {
-              toolResult2 = executeTool(tc.name, tc.args);
-              const resultLen = typeof toolResult2 === 'string' ? toolResult2.length : 0;
-              const sizeLabel = (FEATURES.sizeIndicator && tc.name === 'visualize_read_me') ? ` — ${resultLen.toLocaleString()} chars loaded` : '';
-              sse({ type: 'tool_result', index: i, name: tc.name, resultLen, sizeLabel });
+            let resultLen2 = 0;
+            let sizeLabel2 = '';
 
-              if (tc.name === 'show_widget') {
-                let args;
-                try { args = JSON.parse(tc.args); } catch { args = {}; }
-                const title = args.title || 'widget';
-                const code = args.widget_code || '';
-                if (code) {
-                  sse({ type: 'widget_stream', html: code, title });
-                  sse({ type: 'widget_final', html: code, title });
-                }
+            if (tc.name === 'visualize_read_me') {
+              let args;
+              try { args = JSON.parse(tc.args); } catch { args = {}; }
+              const modules = args.modules || [];
+              toolResult2 = getModuleGuidelines(modules);
+              resultLen2 = typeof toolResult2 === 'string' ? toolResult2.length : JSON.stringify(toolResult2).length;
+              if (chatFeatures.sizeIndicator) {
+                sizeLabel2 = ` — ${resultLen2.toLocaleString()} chars loaded`;
               }
-            } catch(e) {
-              toolResult2 = 'Error: ' + e.message;
-              sse({ type: 'tool_result', index: i, name: tc.name, resultLen: 0, sizeLabel: '' });
+            } else if (tc.name === 'show_widget') {
+              let args;
+              try { args = JSON.parse(tc.args); } catch { args = {}; }
+              const title = args.title || 'widget';
+              const code = args.widget_code || '';
+
+              if (code) {
+                sseSend({
+                  type: 'widget_final',
+                  html: code,
+                  title: title
+                });
+              }
+
+              toolResult2 = `Widget rendered successfully. Title: ${title}`;
+              resultLen2 = typeof toolResult2 === 'string' ? toolResult2.length : JSON.stringify(toolResult2).length;
+            } else {
+              toolResult2 = `Tool ${tc.name} executed.`;
+              resultLen2 = typeof toolResult2 === 'string' ? toolResult2.length : JSON.stringify(toolResult2).length;
             }
+
+            sseSend({
+              type: 'tool_result',
+              index: i,
+              name: tc.name,
+              resultLen: resultLen2,
+              sizeLabel: sizeLabel2
+            });
+
+            log('ok', `r2 executed ${tc.name}() → ${resultLen2.toLocaleString()} chars`);
 
             messages.push({
               role: 'tool',
@@ -1505,28 +1828,103 @@ app.post('/chat', async (req, res) => {
 
           // One more call if needed (after show_widget)
           if (result2.finishReason === 'tool_calls') {
-            const result3 = await doCall(undefined);
-            if (result3.assistantText) {
-              messages.push({ role: 'assistant', content: result3.assistantText });
-            }
+            const result3 = await doCall(messages, undefined);
+            // Text-only response at this point
           }
         }
       }
     }
 
     // Send done event
-    sse({ type: 'done', finishReason: result1.finishReason || 'stop' });
-    res.end();
-  } catch(e) {
-    log('err', `[/chat] Fatal error: ${e.message}\n${e.stack}`);
-    try {
-      sse({ type: 'error', message: e.message });
-      sse({ type: 'done', finishReason: 'error' });
-    } catch(e2) {}
-    try { res.end(); } catch(e3) {}
+    sseSend({ type: 'done', finishReason: result1.finishReason || 'stop' });
+    log('info', `─── /chat turn complete ───`);
+
+    // Final persistence: mark job complete, flush remaining text
+    await persistAssistantText(assistantText || '', true);
+    await persistJobComplete('completed');
+
+  } catch (e) {
+    log('err', `/chat failed: ${e.message}\n${e.stack}`);
+    sseSend({ type: 'error', message: e.message });
+    sseSend({ type: 'done', finishReason: 'error' });
+    await persistJobComplete('error', e.message);
   } finally {
-    // Restore features
-    FEATURES = savedFeatures;
+    // Always release the concurrency slot
+    releaseSlot(chatJobId);
+  }
+
+  res.end();
+});
+
+// Handle CORS preflight for /chat
+app.options('/chat', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.end();
+});
+
+// ==========================================
+// GET /resume/:jobId — Reconnect to an existing job
+// Returns current job state + subscribes to Realtime updates
+// ==========================================
+app.get('/resume/:jobId', async (req, res) => {
+  const { jobId } = req.params;
+  const { secret } = req.query;
+  if (secret !== WORKER_SECRET) {
+    return res.status(403).json({ error: 'Invalid worker secret' });
+  }
+  if (!supabase) {
+    return res.status(503).json({ error: 'Supabase not configured' });
+  }
+
+  try {
+    // Get job status
+    const { data: job, error: jobErr } = await supabase.from('jobs').select('*').eq('id', jobId).single();
+    if (jobErr || !job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    // Get messages
+    const { data: messages } = await supabase.from('messages').select('*').eq('job_id', jobId).order('seq', { ascending: true });
+
+    // Get widget
+    const { data: widgets } = await supabase.from('widgets').select('*').eq('job_id', jobId);
+
+    // Get tool calls
+    const { data: toolCalls } = await supabase.from('tool_calls').select('*').eq('job_id', jobId).order('created_at', { ascending: true });
+
+    res.json({
+      job: { id: job.id, status: job.status, model: job.model, features: job.features, created_at: job.created_at },
+      messages: messages || [],
+      widgets: widgets || [],
+      tool_calls: toolCalls || []
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ==========================================
+// GET /jobs — List recent jobs (for multi-tab sync)
+// ==========================================
+app.get('/jobs', async (req, res) => {
+  const { secret, limit } = req.query;
+  if (secret !== WORKER_SECRET) {
+    return res.status(403).json({ error: 'Invalid worker secret' });
+  }
+  if (!supabase) {
+    return res.status(503).json({ error: 'Supabase not configured' });
+  }
+
+  try {
+    const { data: jobs } = await supabase.from('jobs')
+      .select('id, status, model, features, created_at, updated_at')
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit) || 20);
+    res.json({ jobs: jobs || [] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -1597,9 +1995,40 @@ setTimeout(() => {
     setInterval(pollForJobs, POLL_INTERVAL_MS);
     // Also poll immediately
     pollForJobs();
+
+    // ==========================================
+    // CRASH RECOVERY: Resume jobs left in 'running' state
+    // from a previous worker crash
+    // ==========================================
+    (async () => {
+      try {
+        const { data: staleJobs, error } = await supabase.from('jobs')
+          .select('id, model, features, api_key')
+          .eq('status', 'running')
+          .order('created_at', { ascending: true });
+
+        if (!error && staleJobs && staleJobs.length > 0) {
+          console.log(`[RECOVERY] Found ${staleJobs.length} stale 'running' job(s) — resetting to pending for re-processing`);
+          for (const job of staleJobs) {
+            // Reset to pending so the poller picks them up
+            await supabase.from('jobs').update({
+              status: 'pending',
+              updated_at: new Date().toISOString()
+            }).eq('id', job.id);
+            console.log(`[RECOVERY] Reset job ${job.id} to pending`);
+          }
+        } else if (!error) {
+          console.log('[RECOVERY] No stale running jobs found');
+        }
+      } catch (err) {
+        console.error('[RECOVERY] Error:', err.message);
+      }
+    })();
   }
 }, 2000);
 
 app.listen(PORT, () => {
-  console.log(`Imagine Worker listening on port ${PORT}`);
+  console.log(`Imagine Worker V3 (with /chat SSE + persistence + concurrency) listening on port ${PORT}`);
+  console.log(`  Max concurrent: ${MAX_CONCURRENT} | Supabase: ${supabase ? 'yes' : 'no'}`);
 });
+

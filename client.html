@@ -656,6 +656,44 @@ const WORKER_URL = 'https://example-bg-server-production.up.railway.app';
 const WORKER_SECRET = 'vFXMMRMD-1';
 
 // ==========================================
+// SUPABASE CONFIG — Persistence & Realtime
+// ==========================================
+const SUPABASE_URL = 'https://vvtiiffhwftiloisywdf.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ2dGlpZmZod2Z0aWxvaXN5d2RmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUzMDcyMTUsImV4cCI6MjA5MDg4MzIxNX0.quQYHz69lenvOJ6-v6fJXCw2x6Jj3IAUz2DQFFT6hhQ';
+let supabaseClient = null;
+let currentJobId = null;
+let realtimeSubscription = null;
+
+// Initialize Supabase client if anon key is available
+if (SUPABASE_ANON_KEY && SUPABASE_URL) {
+  try {
+    supabaseClient = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      realtime: { params: { eventsPerSecond: 10 } }
+    }) : null;
+    if (supabaseClient) console.log('[Supabase] Client initialized');
+  } catch(e) {
+    console.warn('[Supabase] Init failed:', e.message);
+  }
+}
+
+// Load Supabase JS from CDN if not already loaded
+if (!window.supabase && SUPABASE_ANON_KEY) {
+  const sbScript = document.createElement('script');
+  sbScript.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
+  sbScript.onload = () => {
+    try {
+      supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        realtime: { params: { eventsPerSecond: 10 } }
+      });
+      console.log('[Supabase] Client initialized (delayed load)');
+    } catch(e) {
+      console.warn('[Supabase] Delayed init failed:', e.message);
+    }
+  };
+  document.head.appendChild(sbScript);
+}
+
+// ==========================================
 // SVG STYLES (for widget iframe shell)
 // ==========================================
 const SVG_STYLES = `svg .t{font-family:var(--font-ui);font-size:14px;fill:var(--p)}
@@ -789,6 +827,10 @@ let _liveSlot = null;
 let _liveActive = false;
 let _renderGen = 0;  // incremented on every finalizeWidget — cancels stale slice timeouts
 let currentWidgetTitle = 'widget preview';
+
+// Per-tab session ID for multi-tab isolation
+// Each browser tab gets a unique ID so the worker can track connections separately
+const TAB_ID = 'tab-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
 
 const $ = id => document.getElementById(id);
 
@@ -1174,7 +1216,8 @@ async function send() {
       messages: messages,
       model: model,
       features: { ...FEATURES },
-      secret: WORKER_SECRET
+      secret: WORKER_SECRET,
+      tab_id: TAB_ID  // Multi-tab isolation: each tab gets unique processing
     };
     if (apiKey) body.apiKey = apiKey;
 
@@ -1217,10 +1260,19 @@ async function send() {
         }
 
         // ── Handle each SSE event type from Railway worker ──
-        // Worker sends: text, reasoning, tool_start, tool_delta,
+        // Worker sends: job_id, text, reasoning, tool_start, tool_delta,
         //               widget_stream, tool_result, widget_final, error, done
 
-        if (data.type === 'text') {
+        if (data.type === 'job_id') {
+          // Worker assigned a persistent job ID — save for reconnection
+          currentJobId = data.job_id;
+          localStorage.setItem('imagine_current_job', currentJobId);
+          log('info', `job_id: ${currentJobId}`);
+          // Subscribe to Realtime updates for this job (multi-tab sync)
+          subscribeToJob(currentJobId);
+        }
+
+        else if (data.type === 'text') {
           // Streaming text content from worker
           if (data.content) {
             assistantText += data.content;
@@ -1505,8 +1557,122 @@ window.addEventListener('resize', checkScreenSize);
   // Check screen size
   checkScreenSize();
 
-  log('ok', 'Imagine thin client loaded — SSE mode via ' + WORKER_URL);
+  // ==========================================
+  // JOB RECOVERY: Check for interrupted job from previous session
+  // ==========================================
+  const lastJobId = localStorage.getItem('imagine_current_job');
+  if (lastJobId) {
+    log('info', `Found previous job ${lastJobId} — checking status for recovery...`);
+    resumeJob(lastJobId).catch(e => {
+      log('warn', `Resume failed: ${e.message}`);
+      localStorage.removeItem('imagine_current_job');
+    });
+  }
+
+  log('ok', 'Imagine thin client loaded — SSE mode via ' + WORKER_URL + (supabaseClient ? ' + Supabase Realtime' : ''));
 })();
+
+// ==========================================
+// SUPABASE REALTIME — Multi-tab sync & job monitoring
+// ==========================================
+function subscribeToJob(jobId) {
+  if (!supabaseClient || !jobId) return;
+  try {
+    // Unsubscribe from previous job
+    if (realtimeSubscription) {
+      supabaseClient.removeChannel(realtimeSubscription);
+    }
+
+    // Subscribe to changes on this job's widgets and messages
+    realtimeSubscription = supabaseClient
+      .channel('job-' + jobId)
+      .on('postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'widgets', filter: `job_id=eq.${jobId}` },
+        (payload) => {
+          log('info', `[Realtime] widget update: is_final=${payload.new.is_final}`);
+          if (payload.new.is_final && payload.new.code && !isStreaming) {
+            // Another tab completed the widget — show it
+            finalizeWidget(payload.new.code, payload.new.title);
+          }
+        }
+      )
+      .on('postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'jobs', filter: `id=eq.${jobId}` },
+        (payload) => {
+          if (payload.new.status === 'completed' && !isStreaming) {
+            log('ok', `[Realtime] job completed in background`);
+            setIndicator('active');
+          } else if (payload.new.status === 'error') {
+            log('err', `[Realtime] job error: ${payload.new.error}`);
+            setIndicator('');
+          }
+        }
+      )
+      .subscribe((status) => {
+        log('info', `[Realtime] subscription: ${status}`);
+      });
+  } catch(e) {
+    log('warn', `[Realtime] subscribe failed: ${e.message}`);
+  }
+}
+
+// ==========================================
+// JOB RESUME — Reconnect to an existing job
+// Fetches current state from worker and rebuilds UI
+// ==========================================
+async function resumeJob(jobId) {
+  try {
+    const resp = await fetch(`${WORKER_URL}/resume/${jobId}?secret=${WORKER_SECRET}`);
+    if (!resp.ok) {
+      log('warn', `Resume: job ${jobId} not found (HTTP ${resp.status})`);
+      localStorage.removeItem('imagine_current_job');
+      return;
+    }
+    const state = await resp.json();
+
+    if (state.job.status === 'completed' || state.job.status === 'error') {
+      // Job already finished — rebuild UI from DB state
+      log('info', `Resume: job ${jobId} is ${state.job.status} — restoring state`);
+
+      // Restore messages
+      if (state.messages && state.messages.length > 0) {
+        for (const m of state.messages) {
+          if (m.role === 'user') {
+            appendMsg('user', m.content);
+          } else if (m.role === 'assistant' && m.content) {
+            appendMsg('assistant', m.content);
+          }
+        }
+      }
+
+      // Restore widget if available
+      if (state.widgets && state.widgets.length > 0) {
+        const w = state.widgets[state.widgets.length - 1];
+        if (w.code) {
+          finalizeWidget(w.code, w.title);
+        }
+      }
+
+      currentJobId = jobId;
+      setIndicator('active');
+      log('ok', `Resume: restored job ${jobId} state`);
+    } else if (state.job.status === 'running') {
+      // Job is still running — subscribe for updates
+      log('info', `Resume: job ${jobId} is still running — subscribing`);
+      currentJobId = jobId;
+      subscribeToJob(jobId);
+      setIndicator('thinking');
+    } else {
+      // Pending — just wait
+      log('info', `Resume: job ${jobId} is ${state.job.status}`);
+      currentJobId = jobId;
+      subscribeToJob(jobId);
+    }
+  } catch(e) {
+    log('warn', `Resume error: ${e.message}`);
+    localStorage.removeItem('imagine_current_job');
+  }
+}
 </script>
 </body>
 </html>
