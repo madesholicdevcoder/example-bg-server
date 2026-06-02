@@ -47,52 +47,6 @@ if (SUPABASE_URL && SUPABASE_URL.startsWith('https://') && SUPABASE_SERVICE_KEY 
 }
 
 // ==========================================
-// CONCURRENCY CONTROL — Semaphore for API calls
-// Prevents overlapping Fireworks requests that cause
-// midway stops and multi-tab race conditions
-// ==========================================
-const MAX_CONCURRENT = 3;
-const activeJobs = new Map(); // jobId -> { startedAt, model, status }
-let currentConcurrent = 0;
-const jobQueue = []; // queued job entries
-
-async function acquireSlot(jobId) {
-  return new Promise((resolve) => {
-    if (currentConcurrent < MAX_CONCURRENT) {
-      currentConcurrent++;
-      activeJobs.set(jobId, { startedAt: Date.now(), status: 'running' });
-      resolve();
-    } else {
-      jobQueue.push({ jobId, resolve });
-      log('info', `Job ${jobId} queued (${jobQueue.length} waiting, ${currentConcurrent} active)`);
-    }
-  });
-}
-
-function releaseSlot(jobId) {
-  activeJobs.delete(jobId);
-  currentConcurrent--;
-  if (jobQueue.length > 0) {
-    const next = jobQueue.shift();
-    currentConcurrent++;
-    activeJobs.set(next.jobId, { startedAt: Date.now(), status: 'running' });
-    next.resolve();
-    log('info', `Queued job ${next.jobId} started (${jobQueue.length} still waiting)`);
-  }
-}
-
-// Cleanup stale jobs (running > 10 min) every 60s
-setInterval(() => {
-  const now = Date.now();
-  for (const [jid, info] of activeJobs) {
-    if (now - info.startedAt > 10 * 60 * 1000) {
-      log('warn', `Stale job ${jid} running >10min, force-releasing slot`);
-      releaseSlot(jid);
-    }
-  }
-}, 60000);
-
-// ==========================================
 // GUIDELINES (base64 encoded) — EXTRACTED VERBATIM
 // ==========================================
 const GUIDELINES_B64 = {
@@ -758,10 +712,6 @@ function log(level, msg) {
 // Writes all state to Supabase DB instead of DOM
 // ==========================================
 async function runJob(jobId) {
-  // Acquire concurrency slot
-  await acquireSlot(jobId);
-
-  try {
   // Read job details from DB
   const { data: job, error: jobErr } = await supabase
     .from('jobs')
@@ -1204,9 +1154,6 @@ async function runJob(jobId) {
     log('err', `Job ${jobId} failed: ${e.message}\n${e.stack}`);
     stopWidgetWriteInterval();
     await supabase.from('jobs').update({ status: 'error', error: e.message }).eq('id', jobId);
-  } finally {
-    // Always release concurrency slot
-    releaseSlot(jobId);
   }
 }
 
@@ -1227,9 +1174,7 @@ app.get('/health', (req, res) => {
     worker_secret_set: WORKER_SECRET !== 'changeme',
     worker_secret_len: WORKER_SECRET.length,
     fireworks_key_set: FIREWORKS_API_KEY.length > 0,
-    client_api_key_supported: true,
-    concurrency: { active: currentConcurrent, max: MAX_CONCURRENT, queued: jobQueue.length },
-    active_jobs: Array.from(activeJobs.keys())
+    client_api_key_supported: true
   });
 });
 
@@ -1279,62 +1224,6 @@ app.post('/chat', async (req, res) => {
     return res.status(400).json({ error: { message: 'messages array required' } });
   }
 
-  // ==========================================
-  // MULTI-TAB: Track active SSE connections per tab
-  // If a tab sends a new request while still streaming, close the old one
-  // ==========================================
-  const activeTabConnections = app.get('activeTabConnections') || new Map();
-  if (tabId && activeTabConnections.has(tabId)) {
-    const oldConn = activeTabConnections.get(tabId);
-    log('info', `Tab ${tabId} has existing connection — closing old SSE stream`);
-    try { oldConn.res.end(); } catch(e) {}
-    releaseSlot(oldConn.jobId);
-    activeTabConnections.delete(tabId);
-  }
-  app.set('activeTabConnections', activeTabConnections);
-
-  // ==========================================
-  // PERSISTENCE: Create job in Supabase for crash recovery
-  // Even if SSE disconnects, the job continues in background
-  // ==========================================
-  const chatJobId = 'chat-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-  let dbJobId = null;
-  let sseDisconnected = false;
-
-  if (supabase) {
-    try {
-      const chatFeaturesTmp = Object.assign({}, FEATURE_DEFAULTS);
-      if (clientFeatures && typeof clientFeatures === 'object') {
-        Object.keys(clientFeatures).forEach(k => {
-          if (chatFeaturesTmp[k] !== undefined) chatFeaturesTmp[k] = clientFeatures[k];
-        });
-      }
-      const { data: jobRow, error: jobErr } = await supabase.from('jobs').insert({
-        status: 'running',
-        model: model || DEFAULT_MODEL,
-        features: chatFeaturesTmp
-      }).select().single();
-      if (!jobErr && jobRow) {
-        dbJobId = jobRow.id;
-        // Write the user messages to DB
-        let seq = 1;
-        for (const m of clientMessages) {
-          if (m.role === 'user' && m.content) {
-            await supabase.from('messages').insert({ job_id: dbJobId, role: 'user', content: m.content, seq: seq++ });
-          }
-        }
-        log('info', `Persistence: created job ${dbJobId} for /chat session`);
-      } else {
-        log('warn', `Persistence: could not create job: ${jobErr?.message}`);
-      }
-    } catch (e) {
-      log('warn', `Persistence: job creation failed: ${e.message}`);
-    }
-  }
-
-  // Acquire concurrency slot
-  await acquireSlot(chatJobId);
-
   // Set up SSE headers
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -1344,113 +1233,13 @@ app.post('/chat', async (req, res) => {
     'X-Accel-Buffering': 'no'  // Disable nginx buffering
   });
 
-  // Send the job_id to the client so it can reconnect/resume
-  if (dbJobId) {
-    try { res.write(`data: ${JSON.stringify({ type: 'job_id', job_id: dbJobId })}\n\n`); } catch(e) {}
-  }
-
-  // Track if SSE is still connected
-  req.on('close', () => {
-    sseDisconnected = true;
-    // Clean up tab connection tracking
-    const conns = app.get('activeTabConnections');
-    if (tabId && conns && conns.get(tabId)?.jobId === chatJobId) {
-      conns.delete(tabId);
-    }
-    log('info', `SSE client disconnected for ${chatJobId} — background processing continues`);
-  });
-
-  // Register this tab's active connection
-  if (tabId) {
-    activeTabConnections.set(tabId, { res, jobId: chatJobId });
-    app.set('activeTabConnections', activeTabConnections);
-  }
-
-  // Helper to send SSE event (only if client still connected)
+  // Helper to send SSE event
   function sseSend(data) {
-    if (sseDisconnected) return; // Client gone, but processing continues
     try {
       res.write(`data: ${JSON.stringify(data)}\n\n`);
     } catch (e) {
       log('err', `SSE write error: ${e.message}`);
-      sseDisconnected = true;
     }
-  }
-
-  // Throttled DB writes for persistence (don't write every token)
-  let _lastAssistantWrite = 0;
-  let _accumulatedAssistant = '';
-  let _accumulatedReasoning = '';
-  let _lastWidgetWrite = 0;
-  let _widgetSeq = 10; // starts after user messages
-  let _toolCallSeq = 0;
-  const DB_WRITE_INTERVAL = 1000; // Write to DB every 1s max
-
-  async function persistAssistantText(text, isFinal = false) {
-    if (!supabase || !dbJobId) return;
-    _accumulatedAssistant = text;
-    const now = Date.now();
-    if (isFinal || now - _lastAssistantWrite > DB_WRITE_INTERVAL) {
-      _lastAssistantWrite = now;
-      try {
-        // Upsert the assistant message (one row per turn, updated as it streams)
-        const { data: existing } = await supabase.from('messages')
-          .select('id').eq('job_id', dbJobId).eq('role', 'assistant')
-          .order('seq', { ascending: false }).limit(1).single();
-        if (existing) {
-          await supabase.from('messages').update({ content: _accumulatedAssistant })
-            .eq('id', existing.id);
-        } else {
-          _widgetSeq++;
-          await supabase.from('messages').insert({
-            job_id: dbJobId, role: 'assistant', content: _accumulatedAssistant, seq: _widgetSeq
-          });
-        }
-      } catch (e) { /* non-critical */ }
-    }
-  }
-
-  async function persistWidget(code, title, isFinal) {
-    if (!supabase || !dbJobId) return;
-    const now = Date.now();
-    if (isFinal || now - _lastWidgetWrite > 500) {
-      _lastWidgetWrite = now;
-      try {
-        const { data: existing } = await supabase.from('widgets')
-          .select('id').eq('job_id', dbJobId).limit(1).single();
-        if (existing) {
-          await supabase.from('widgets').update({
-            code, title: title || 'widget', is_final: isFinal,
-            updated_at: new Date().toISOString()
-          }).eq('id', existing.id);
-        } else {
-          await supabase.from('widgets').insert({
-            job_id: dbJobId, code, title: title || 'widget', is_final: isFinal
-          });
-        }
-      } catch (e) { /* non-critical */ }
-    }
-  }
-
-  async function persistToolCall(name, args, status) {
-    if (!supabase || !dbJobId) return;
-    try {
-      _toolCallSeq++;
-      await supabase.from('tool_calls').insert({
-        job_id: dbJobId, name,
-        args: typeof args === 'string' ? args : JSON.stringify(args),
-        status
-      });
-    } catch (e) { /* non-critical */ }
-  }
-
-  async function persistJobComplete(status, error = null) {
-    if (!supabase || !dbJobId) return;
-    try {
-      await supabase.from('jobs').update({
-        status, error, updated_at: new Date().toISOString()
-      }).eq('id', dbJobId);
-    } catch (e) { /* non-critical */ }
   }
 
   // Set up feature flags from request body, falling back to defaults
@@ -1577,8 +1366,6 @@ app.post('/chat', async (req, res) => {
                 content: delta.content,
                 full: assistantText
               });
-              // Persist assistant text to DB (throttled)
-              persistAssistantText(assistantText);
             }
           }
 
@@ -1623,8 +1410,6 @@ app.post('/chat', async (req, res) => {
                       html: partialCode,
                       title: title || undefined
                     });
-                    // Persist widget to DB (throttled) for crash recovery
-                    persistWidget(partialCode, title, false);
                   }
                 }
               }
@@ -1703,8 +1488,6 @@ app.post('/chat', async (req, res) => {
           if (chatFeatures.sizeIndicator) {
             sizeLabel = ` — ${resultLen.toLocaleString()} chars loaded`;
           }
-          // Persist tool call to DB
-          persistToolCall('visualize_read_me', tc.args, 'done');
         } else if (tc.name === 'show_widget') {
           // Execute show_widget → extract widget code and send widget events
           let args;
@@ -1719,14 +1502,10 @@ app.post('/chat', async (req, res) => {
               html: code,
               title: title
             });
-            // Persist final widget to DB
-            persistWidget(code, title, true);
           }
 
           toolResult = `Widget rendered successfully. Title: ${title}`;
           resultLen = typeof toolResult === 'string' ? toolResult.length : JSON.stringify(toolResult).length;
-          // Persist tool call to DB
-          persistToolCall('show_widget', tc.args, 'done');
         } else {
           toolResult = `Tool ${tc.name} executed.`;
           resultLen = typeof toolResult === 'string' ? toolResult.length : JSON.stringify(toolResult).length;
@@ -1839,18 +1618,10 @@ app.post('/chat', async (req, res) => {
     sseSend({ type: 'done', finishReason: result1.finishReason || 'stop' });
     log('info', `─── /chat turn complete ───`);
 
-    // Final persistence: mark job complete, flush remaining text
-    await persistAssistantText(assistantText || '', true);
-    await persistJobComplete('completed');
-
   } catch (e) {
     log('err', `/chat failed: ${e.message}\n${e.stack}`);
     sseSend({ type: 'error', message: e.message });
     sseSend({ type: 'done', finishReason: 'error' });
-    await persistJobComplete('error', e.message);
-  } finally {
-    // Always release the concurrency slot
-    releaseSlot(chatJobId);
   }
 
   res.end();
@@ -1862,70 +1633,6 @@ app.options('/chat', (req, res) => {
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.end();
-});
-
-// ==========================================
-// GET /resume/:jobId — Reconnect to an existing job
-// Returns current job state + subscribes to Realtime updates
-// ==========================================
-app.get('/resume/:jobId', async (req, res) => {
-  const { jobId } = req.params;
-  const { secret } = req.query;
-  if (secret !== WORKER_SECRET) {
-    return res.status(403).json({ error: 'Invalid worker secret' });
-  }
-  if (!supabase) {
-    return res.status(503).json({ error: 'Supabase not configured' });
-  }
-
-  try {
-    // Get job status
-    const { data: job, error: jobErr } = await supabase.from('jobs').select('*').eq('id', jobId).single();
-    if (jobErr || !job) {
-      return res.status(404).json({ error: 'Job not found' });
-    }
-
-    // Get messages
-    const { data: messages } = await supabase.from('messages').select('*').eq('job_id', jobId).order('seq', { ascending: true });
-
-    // Get widget
-    const { data: widgets } = await supabase.from('widgets').select('*').eq('job_id', jobId);
-
-    // Get tool calls
-    const { data: toolCalls } = await supabase.from('tool_calls').select('*').eq('job_id', jobId).order('created_at', { ascending: true });
-
-    res.json({
-      job: { id: job.id, status: job.status, model: job.model, features: job.features, created_at: job.created_at },
-      messages: messages || [],
-      widgets: widgets || [],
-      tool_calls: toolCalls || []
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ==========================================
-// GET /jobs — List recent jobs (for multi-tab sync)
-// ==========================================
-app.get('/jobs', async (req, res) => {
-  const { secret, limit } = req.query;
-  if (secret !== WORKER_SECRET) {
-    return res.status(403).json({ error: 'Invalid worker secret' });
-  }
-  if (!supabase) {
-    return res.status(503).json({ error: 'Supabase not configured' });
-  }
-
-  try {
-    const { data: jobs } = await supabase.from('jobs')
-      .select('id, status, model, features, created_at, updated_at')
-      .order('created_at', { ascending: false })
-      .limit(parseInt(limit) || 20);
-    res.json({ jobs: jobs || [] });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
 });
 
 // ==========================================
@@ -1995,40 +1702,10 @@ setTimeout(() => {
     setInterval(pollForJobs, POLL_INTERVAL_MS);
     // Also poll immediately
     pollForJobs();
-
-    // ==========================================
-    // CRASH RECOVERY: Resume jobs left in 'running' state
-    // from a previous worker crash
-    // ==========================================
-    (async () => {
-      try {
-        const { data: staleJobs, error } = await supabase.from('jobs')
-          .select('id, model, features, api_key')
-          .eq('status', 'running')
-          .order('created_at', { ascending: true });
-
-        if (!error && staleJobs && staleJobs.length > 0) {
-          console.log(`[RECOVERY] Found ${staleJobs.length} stale 'running' job(s) — resetting to pending for re-processing`);
-          for (const job of staleJobs) {
-            // Reset to pending so the poller picks them up
-            await supabase.from('jobs').update({
-              status: 'pending',
-              updated_at: new Date().toISOString()
-            }).eq('id', job.id);
-            console.log(`[RECOVERY] Reset job ${job.id} to pending`);
-          }
-        } else if (!error) {
-          console.log('[RECOVERY] No stale running jobs found');
-        }
-      } catch (err) {
-        console.error('[RECOVERY] Error:', err.message);
-      }
-    })();
   }
 }, 2000);
 
 app.listen(PORT, () => {
-  console.log(`Imagine Worker V3 (with /chat SSE + persistence + concurrency) listening on port ${PORT}`);
-  console.log(`  Max concurrent: ${MAX_CONCURRENT} | Supabase: ${supabase ? 'yes' : 'no'}`);
+  console.log(`Imagine Worker V3 (with /chat SSE) listening on port ${PORT}`);
 });
 
